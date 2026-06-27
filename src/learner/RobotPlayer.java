@@ -4,6 +4,7 @@ import battlecode.common.*;
 
 public strictfp class RobotPlayer {
     static int turnCount = 0;
+    static NeuralNet nn = new NeuralNet();
 
     static final Direction[] allDirections = {
         Direction.CENTER,
@@ -16,16 +17,6 @@ public strictfp class RobotPlayer {
         Direction.WEST,
         Direction.NORTHWEST,
     };
-
-    static NeuralNet nn = new NeuralNet();
-
-    static int argmax(float[] a) {
-        int best = 0;
-        for (int i = 1; i < a.length; i++) {
-            if (a[i] > a[best]) best = i;
-        }
-        return best;
-    }
 
     static int dirToInt(Direction d) {
         if (d == Direction.CENTER) return 0;
@@ -56,63 +47,46 @@ public strictfp class RobotPlayer {
                 Team opponent = rc.getTeam().opponent();
                 RobotInfo[] enemies = rc.senseNearbyRobots(-1, opponent);
 
-                if (enemies.length > 0) {
+                MapLocation preMoveClosest = closestEnemyLoc(rc, enemies);
+
+                autoActions(rc, enemies);
+
+                if (enemies.length == 0) {
+                    rc.setIndicatorString("RUSH");
+                    if (rc.isMovementReady())
+                        Navigator.moveTo(Globals.oppositeLocation);
+                    enemies = rc.senseNearbyRobots(-1, opponent);
+                    autoActions(rc, enemies);
+                } else {
                     float[] state = buildState(rc, enemies);
-                    float[][] q = nn.forward(state);
+                    float[] q = nn.forward(state);
+                    int bestTile = argmax(q);
 
-                    int bestAction    = argmax(q[2]);
-                    int bestActionDir = argmax(q[3]);
-                    if (bestAction > 0)
-                        executeAction(rc, enemies, bestAction, bestActionDir);
+                    rc.setIndicatorString("tile" + bestTile);
 
-                    int bestMoved  = argmax(q[0]);
-                    int bestFacing = argmax(q[1]);
-
-                    rc.setIndicatorString("m" + bestMoved + " f" + bestFacing + " a" + bestAction + " d" + bestActionDir);
-
-                    if (bestMoved > 0) {
-                        Direction d = allDirections[bestMoved];
+                    if (bestTile > 0) {
+                        Direction d = allDirections[bestTile];
                         if (rc.getDirection() != d && rc.canTurn(d))
                             rc.turn(d);
                         if (rc.isMovementReady()) {
                             if (rc.canMove(d)) {
                                 rc.move(d);
                             } else if (rc.canMove(d.rotateLeft())) {
-                                d = d.rotateLeft();
-                                rc.move(d);
+                                rc.move(d.rotateLeft());
                             } else if (rc.canMove(d.rotateRight())) {
-                                d = d.rotateRight();
-                                rc.move(d);
+                                rc.move(d.rotateRight());
+                            } else if (rc.canMove(d.rotateLeft().rotateLeft())) {
+                                rc.move(d.rotateLeft().rotateLeft());
+                            } else if (rc.canMove(d.rotateRight().rotateRight())) {
+                                rc.move(d.rotateRight().rotateRight());
                             }
                         }
-                    } else {
-                        Direction targetFacing = allDirections[bestFacing];
-                        if (rc.getDirection() != targetFacing && rc.canTurn(targetFacing))
-                            rc.turn(targetFacing);
                     }
 
                     enemies = rc.senseNearbyRobots(-1, opponent);
-                    if (enemies.length > 0) {
-                        state = buildState(rc, enemies);
-                        q = nn.forward(state);
-                        bestAction    = argmax(q[2]);
-                        bestActionDir = argmax(q[3]);
-                        if (bestAction > 0)
-                            executeAction(rc, enemies, bestAction, bestActionDir);
-                    }
-                } else {
-                    rc.setIndicatorString("RUSH");
-                    if (rc.isMovementReady())
-                        Navigator.moveTo(Globals.oppositeLocation);
-                    enemies = rc.senseNearbyRobots(-1, opponent);
-                    if (enemies.length > 0) {
-                        float[] state = buildState(rc, enemies);
-                        float[][] q = nn.forward(state);
-                        int bestAction    = argmax(q[2]);
-                        int bestActionDir = argmax(q[3]);
-                        if (bestAction > 0)
-                            executeAction(rc, enemies, bestAction, bestActionDir);
-                    }
+                    autoActions(rc, enemies);
+
+                    faceClosest(rc, enemies, preMoveClosest);
                 }
 
             } catch (GameActionException e) {
@@ -127,17 +101,65 @@ public strictfp class RobotPlayer {
         }
     }
 
-    static void executeAction(RobotController rc, RobotInfo[] enemies, int actionType, int actionDir) throws GameActionException {
+    static int argmax(float[] a) {
+        int best = 0;
+        for (int i = 1; i < a.length; i++) {
+            if (a[i] > a[best]) best = i;
+        }
+        return best;
+    }
+
+    static MapLocation closestEnemyLoc(RobotController rc, RobotInfo[] enemies) {
+        MapLocation myLoc = rc.getLocation();
+        MapLocation best = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (RobotInfo ri : enemies) {
+            int d = myLoc.distanceSquaredTo(ri.getLocation());
+            if (d < bestDist) {
+                bestDist = d;
+                best = ri.getLocation();
+            }
+        }
+        return best;
+    }
+
+    static void faceClosest(RobotController rc, RobotInfo[] enemies, MapLocation remembered) throws GameActionException {
+        if (!rc.canTurn()) return;
+
+        MapLocation myLoc = rc.getLocation();
+        MapLocation closest = null;
+        int bestDist = Integer.MAX_VALUE;
+
+        for (RobotInfo ri : enemies) {
+            int d = myLoc.distanceSquaredTo(ri.getLocation());
+            if (d < bestDist) {
+                bestDist = d;
+                closest = ri.getLocation();
+            }
+        }
+
+        if (remembered != null) {
+            int d = myLoc.distanceSquaredTo(remembered);
+            if (d < bestDist) {
+                bestDist = d;
+                closest = remembered;
+            }
+        }
+
+        if (closest != null) {
+            Direction toClosest = myLoc.directionTo(closest);
+            if (rc.getDirection() != toClosest && rc.canTurn(toClosest))
+                rc.turn(toClosest);
+        }
+    }
+
+    static void autoActions(RobotController rc, RobotInfo[] enemies) throws GameActionException {
         if (!rc.isActionReady()) return;
 
-        Direction turnDir = allDirections[actionDir];
-        if (rc.getDirection() != turnDir && rc.canTurn(turnDir))
-            rc.turn(turnDir);
-
-        if (actionType == 1) {
-            MapLocation myLoc = rc.getLocation();
+        if (rc.getCarrying() != null && rc.canThrowRat() && enemies.length > 0 && rc.canTurn()) {
             RobotInfo closest = null;
             int closestDist = Integer.MAX_VALUE;
+            MapLocation myLoc = rc.getLocation();
             for (RobotInfo ri : enemies) {
                 int d = myLoc.distanceSquaredTo(ri.getLocation());
                 if (d < closestDist) {
@@ -145,19 +167,48 @@ public strictfp class RobotPlayer {
                     closest = ri;
                 }
             }
-            if (closest != null && rc.canAttack(closest.getLocation()))
-                rc.attack(closest.getLocation());
-        } else if (actionType == 2) {
-            for (RobotInfo ri : enemies) {
-                MapLocation el = ri.getLocation();
-                if (ri.getType() == UnitType.BABY_RAT && rc.canCarryRat(el)) {
-                    rc.carryRat(el);
-                    return;
-                }
+            if (closest != null) {
+                rc.turn(myLoc.directionTo(closest.getLocation()));
             }
-        } else if (actionType == 3) {
             if (rc.canThrowRat())
                 rc.throwRat();
+        }
+
+        if (!rc.isActionReady()) return;
+
+        for (RobotInfo ri : enemies) {
+            if (ri.getType() == UnitType.RAT_KING) {
+                MapLocation kingLoc = ri.getLocation();
+                Direction toKing = rc.getLocation().directionTo(kingLoc);
+                if (rc.getDirection() != toKing && rc.canTurn(toKing))
+                    rc.turn(toKing);
+                if (rc.canThrowRat() && rc.getDirection() == toKing) {
+                    rc.throwRat();
+                    return;
+                }
+                MapLocation atkLoc = kingLoc.subtract(toKing);
+                if (rc.canAttack(atkLoc)) {
+                    rc.attack(atkLoc);
+                    return;
+                }
+                break;
+            }
+        }
+
+        if (!rc.isActionReady()) return;
+        for (RobotInfo ri : enemies) {
+            MapLocation el = ri.getLocation();
+            if (ri.getType() == UnitType.BABY_RAT && rc.canCarryRat(el)) {
+                rc.carryRat(el);
+                return;
+            }
+        }
+        for (RobotInfo ri : enemies) {
+            MapLocation el = ri.getLocation();
+            if (rc.canAttack(el)) {
+                rc.attack(el);
+                return;
+            }
         }
     }
 

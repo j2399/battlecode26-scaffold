@@ -1,4 +1,4 @@
-package learner;
+package econ5;
 
 public class NeuralNet {
     private static final int STATE_DIM = 18;

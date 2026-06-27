@@ -20,20 +20,21 @@ MAPS = [
 ]
 MAX_ROUNDS = 100
 STATE_DIM = 18
-TEACHER_EPOCHS = 2000
-STUDENT_EPOCHS = 3000
+NUM_TILES = 9
+TEACHER_EPOCHS = 1500
+STUDENT_EPOCHS = 2250
 BATCH_SIZE = 2048
 LR = 1e-3
 MODEL_PATH = os.path.join(BOTS_DIR, "qnet.pth")
 
-def weights_java_path(package="learner"):
+def weights_java_path(package="econ5"):
     return os.path.join(BOTS_DIR, "src", package, "QNetWeights.java")
 
-def neuralnet_java_path(package="learner"):
+def neuralnet_java_path(package="econ5"):
     return os.path.join(BOTS_DIR, "src", package, "NeuralNet.java")
 
 
-class TeacherQNet(nn.Module):
+class TeacherTileNet(nn.Module):
     def __init__(self, state_dim):
         super().__init__()
         self.shared = nn.Sequential(
@@ -44,27 +45,25 @@ class TeacherQNet(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(),
         )
-        self.q_moved  = nn.Linear(64, 9)
-        self.q_facing = nn.Linear(64, 9)
+        self.q_tilescore = nn.Linear(64, NUM_TILES)
 
     def forward(self, x):
         h = self.shared(x)
-        return self.q_moved(h), self.q_facing(h)
+        return self.q_tilescore(h)
 
 
-class StudentQNet(nn.Module):
-    def __init__(self, state_dim, hidden=36):
+class StudentTileNet(nn.Module):
+    def __init__(self, state_dim, hidden=24):
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(state_dim, hidden),
             nn.ReLU(),
         )
-        self.q_moved  = nn.Linear(hidden, 9)
-        self.q_facing = nn.Linear(hidden, 9)
+        self.q_tilescore = nn.Linear(hidden, NUM_TILES)
 
     def forward(self, x):
         h = self.shared(x)
-        return self.q_moved(h), self.q_facing(h)
+        return self.q_tilescore(h)
 
 
 def parse_obs(line):
@@ -107,10 +106,10 @@ def parse_obs(line):
         raw[17],                       # carrying (0/1)
     ]
     value = float(parts[1]) if parts[1].strip() else 0.0
-    act = [int(x) for x in parts[2].split(",") if x.strip()]
-    while len(act) < 2:
-        act.append(0)
-    return state, tuple(act[:2]), value, robot_id, capture_flag
+    tilescores = [int(x) for x in parts[2].split(",") if x.strip()]
+    while len(tilescores) < NUM_TILES:
+        tilescores.append(0)
+    return state, tilescores, value, robot_id, capture_flag
 
 
 def run_match(map_name, team_a, team_b, max_rounds):
@@ -142,80 +141,78 @@ def run_match(map_name, team_a, team_b, max_rounds):
             continue
         parsed = parse_obs(line)
         if parsed:
-            state, action, value, robot_id, capture_flag = parsed
+            state, tilescores, value, robot_id, capture_flag = parsed
             if capture_flag and robot_id in prev_by_id:
                 prev_idx = prev_by_id[robot_id]
-                old_state, old_action, old_value = samples[prev_idx]
-                samples[prev_idx] = (old_state, old_action, old_value - 80)
+                old_state, old_ts, old_value = samples[prev_idx]
+                samples[prev_idx] = (old_state, old_ts, old_value - 80)
             prev_by_id[robot_id] = len(samples)
-            samples.append((state, action, value))
+            samples.append((state, tilescores, value))
     return samples
 
 
 def train_teacher(replay_data, device, epochs=TEACHER_EPOCHS, batch_size=BATCH_SIZE, lr=LR):
-    print(f"Training teacher on {device}")
+    print(f"Training teacher on {device}", flush=True)
     t0 = time.time()
-    model = TeacherQNet(STATE_DIM).to(device)
+    model = TeacherTileNet(STATE_DIM).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 
+    # Pre-tensorize data once
+    states = torch.tensor([x[0] for x in replay_data], dtype=torch.float32).to(device)
+    targets = torch.tensor([x[1] for x in replay_data], dtype=torch.float32).to(device)
+    n = len(states)
+
     for epoch in range(epochs):
-        random.shuffle(replay_data)
+        perm = torch.randperm(n, device=device)
         total_loss = 0.0
-        for i in range(0, len(replay_data), batch_size):
-            batch = replay_data[i : i + batch_size]
-            states = torch.tensor([x[0] for x in batch], dtype=torch.float32).to(device)
-            values = torch.tensor([x[2] for x in batch], dtype=torch.float32).to(device)
+        for i in range(0, n, batch_size):
+            idx = perm[i:i+batch_size]
+            s, t = states[idx], targets[idx]
 
-            qm, qf = model(states)
-
-            actions = torch.tensor(
-                [[x[1][0], x[1][1]] for x in batch],
-                dtype=torch.long, device=device,
-            )
-            predicted = (qm.gather(1, actions[:, 0:1]) +
-                         qf.gather(1, actions[:, 1:2])).squeeze(1)
-            loss = loss_fn(predicted, values)
+            predicted = model(s)
+            loss = loss_fn(predicted, t)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            total_loss += loss.item() * len(batch)
+            total_loss += loss.item() * len(idx)
 
-        avg = total_loss / len(replay_data)
-        if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
-            print(f"  Teacher Epoch {epoch+1}/{epochs}  loss={avg:.6f}  [{time.time()-t0:.0f}s]")
+        avg = total_loss / n
+        print(f"  Teacher Epoch {epoch+1}/{epochs}  loss={avg:.6f}  [{time.time()-t0:.0f}s]", flush=True)
 
     return model, avg, time.time() - t0
 
 
-def distill(teacher, replay_data, device, hidden_dim=36, epochs=STUDENT_EPOCHS, batch_size=BATCH_SIZE, lr=LR):
-    print(f"Distilling student (hidden={hidden_dim}) on {device}")
+def distill(teacher, replay_data, device, hidden_dim=24, epochs=STUDENT_EPOCHS, batch_size=BATCH_SIZE, lr=LR):
+    print(f"Distilling student (hidden={hidden_dim}) on {device}", flush=True)
     t0 = time.time()
-    student = StudentQNet(STATE_DIM, hidden_dim).to(device)
+    student = StudentTileNet(STATE_DIM, hidden_dim).to(device)
     optimizer = optim.Adam(student.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 
+    # Pre-tensorize states and pre-compute teacher targets
+    states = torch.tensor([x[0] for x in replay_data], dtype=torch.float32).to(device)
+    n = len(states)
     teacher.eval()
+    with torch.no_grad():
+        t_out = teacher(states)
+
     for epoch in range(epochs):
-        random.shuffle(replay_data)
+        perm = torch.randperm(n, device=device)
         total_loss = 0.0
-        for i in range(0, len(replay_data), batch_size):
-            batch = replay_data[i : i + batch_size]
-            states = torch.tensor([x[0] for x in batch], dtype=torch.float32).to(device)
+        for i in range(0, n, batch_size):
+            idx = perm[i:i+batch_size]
+            s = states[idx]
 
-            with torch.no_grad():
-                t_qm, t_qf = teacher(states)
-
-            s_qm, s_qf = student(states)
-            loss = loss_fn(s_qm, t_qm) + loss_fn(s_qf, t_qf)
+            s_out = student(s)
+            loss = loss_fn(s_out, t_out[idx])
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            total_loss += loss.item() * len(batch)
+            total_loss += loss.item() * len(idx)
 
-        avg = total_loss / len(replay_data)
-        if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
-            print(f"  Student Epoch {epoch+1}/{epochs}  distill_loss={avg:.6f}  [{time.time()-t0:.0f}s]")
+        avg = total_loss / n
+        print(f"  Student Epoch {epoch+1}/{epochs}  distill_loss={avg:.6f}  [{time.time()-t0:.0f}s]", flush=True)
 
     return student, avg, time.time() - t0
 
@@ -224,8 +221,7 @@ def export_weights_java(model, path, package="learner"):
     named = {n: p.data for n, p in model.named_parameters()}
     tensor_order = [
         "shared.0.weight", "shared.0.bias",
-        "q_moved.weight",  "q_moved.bias",
-        "q_facing.weight", "q_facing.bias",
+        "q_tilescore.weight",  "q_tilescore.bias",
     ]
 
     with open(path, "w") as f:
@@ -246,17 +242,15 @@ def export_weights_java(model, path, package="learner"):
             f.write("\n  };\n\n")
 
         f.write("}\n")
-    print(f"Weights written to {path}")
+    print(f"Weights written to {path}", flush=True)
 
 
-def export_neuralnet_java(model, path, package="learner", state_dim=18, hidden=36):
+def export_neuralnet_java(model, path, package="learner", state_dim=18, hidden=24):
     named = {n: p.data for n, p in model.named_parameters()}
     w_sh = named["shared.0.weight"]
     b_sh = named["shared.0.bias"]
-    w_mv = named["q_moved.weight"]
-    b_mv = named["q_moved.bias"]
-    w_fc = named["q_facing.weight"]
-    b_fc = named["q_facing.bias"]
+    w_out = named["q_tilescore.weight"]
+    b_out = named["q_tilescore.bias"]
 
     fmt = lambda v: f"{v:.12e}f"
 
@@ -265,8 +259,8 @@ def export_neuralnet_java(model, path, package="learner", state_dim=18, hidden=3
         f.write("public class NeuralNet {\n")
         f.write(f"    private static final int STATE_DIM = {state_dim};\n")
         f.write(f"    private static final int HIDDEN = {hidden};\n\n")
-        f.write("    private static final float[][] out = new float[2][9];\n\n")
-        f.write("    public float[][] forward(float[] in) {\n")
+        f.write(f"    private static final float[] out0 = new float[{NUM_TILES}];\n\n")
+        f.write("    public float[] forward(float[] in) {\n")
 
         for i in range(state_dim):
             f.write(f"        float in{i}  = in[{i}];\n")
@@ -282,71 +276,33 @@ def export_neuralnet_java(model, path, package="learner", state_dim=18, hidden=3
             f.write(f"        h{j} += {fmt(b)};\n")
             f.write(f"        if (h{j} < 0) h{j} = 0;\n\n")
 
-        f.write("        float[] out0 = out[0];\n")
-        for j in range(9):
+        for j in range(NUM_TILES):
             f.write(f"        out0[{j}] = 0")
             for i in range(hidden):
-                w = w_mv[j, i].item()
+                w = w_out[j, i].item()
                 f.write(f" + {fmt(w)} * h{i}")
-            b = b_mv[j].item()
+            b = b_out[j].item()
             f.write(f" + {fmt(b)};\n")
 
-        f.write("\n        float[] out1 = out[1];\n")
-        for j in range(9):
-            f.write(f"        out1[{j}] = 0")
-            for i in range(hidden):
-                w = w_fc[j, i].item()
-                f.write(f" + {fmt(w)} * h{i}")
-            b = b_fc[j].item()
-            f.write(f" + {fmt(b)};\n")
-
-        f.write("\n        return out;\n")
+        f.write("\n        return out0;\n")
         f.write("    }\n")
         f.write("}\n")
-    print(f"NeuralNet written to {path}")
-
-
-def copy_learner_package(version):
-    src = os.path.join(BOTS_DIR, "src", "learner")
-    dst = os.path.join(BOTS_DIR, "src", f"learner_v{version}")
-    os.makedirs(dst, exist_ok=True)
-    for fname in os.listdir(src):
-        if not fname.endswith(".java"):
-            continue
-        with open(os.path.join(src, fname)) as f:
-            content = f.read()
-        content = content.replace("package learner;", f"package learner_v{version};")
-        content = content.replace("import learner.", f"import learner_v{version}.")
-        with open(os.path.join(dst, fname), "w") as f:
-            f.write(content)
-
-
-STATE_PATH = os.path.join(BOTS_DIR, "training_state.pt")
-
-
-def save_state(all_samples, iteration, target):
-    torch.save({"all_samples": all_samples, "iteration": iteration, "target": target}, STATE_PATH)
-    sys.stdout.flush()
-
-
-def load_state():
-    if os.path.exists(STATE_PATH):
-        state = torch.load(STATE_PATH, weights_only=True)
-        return state["all_samples"], state["iteration"], state["target"]
-    return None, 0, 1
+    print(f"NeuralNet written to {path}", flush=True)
 
 
 def main():
-    device = torch.device("cpu")
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}", flush=True)
 
     dataset_path = os.path.join(BOTS_DIR, "dataset_enemy.pt")
     data = torch.load(dataset_path, weights_only=True)
     states = data["states"]
-    actions = data["actions"]
-    values = data["values"]
-    samples = list(zip(states.tolist(), [tuple(a.tolist()) for a in actions], values.tolist()))
+    tilescores = data["tilescores"]
+    samples = list(zip(states.tolist(), tilescores.tolist()))
     print(f"Loaded {len(samples)} enemy-only samples", flush=True)
+
+    random.shuffle(samples)
+    print(f"Using all {len(samples)} samples", flush=True)
 
     print(f"\n[1/2] Training teacher on {len(samples)} samples ({TEACHER_EPOCHS} epochs)...", flush=True)
     teacher, teacher_loss, t_time = train_teacher(samples, device)
@@ -359,8 +315,11 @@ def main():
     torch.save(student.state_dict(), MODEL_PATH)
     print(f"  Saved qnet.pth", flush=True)
 
-    export_neuralnet_java(student, neuralnet_java_path("micro_move_imitator"), "micro_move_imitator")
-    print(f"  Exported NeuralNet.java to micro_move_imitator/", flush=True)
+    export_neuralnet_java(student, neuralnet_java_path("econ5"), "econ5")
+    print(f"  Exported NeuralNet.java to econ5/", flush=True)
+
+    export_neuralnet_java(student, neuralnet_java_path("learner"), "learner")
+    print(f"  Exported NeuralNet.java to learner/", flush=True)
 
     print(f"\n{'='*60}", flush=True)
     print(f"Done! Teacher: {t_time:.0f}s, Student: {s_time:.0f}s", flush=True)

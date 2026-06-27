@@ -59,10 +59,10 @@ def parse_obs(line):
         raw[17],
     ]
     value = float(parts[1]) if parts[1].strip() else 0.0
-    act = [int(x) for x in parts[2].split(",") if x.strip()]
-    while len(act) < 5:
-        act.append(0)
-    return state, tuple(act[:2]), value, robot_id, capture_flag
+    tilescores = [int(x) for x in parts[2].split(",") if x.strip()]
+    while len(tilescores) < 9:
+        tilescores.append(0)
+    return state, tilescores, value, robot_id, capture_flag
 
 def run_match(map_name, team_a, team_b, max_rounds):
     props_path = os.path.join(BOTS_DIR, "gradle.properties")
@@ -76,7 +76,7 @@ def run_match(map_name, team_a, team_b, max_rounds):
         f.write(props)
     result = subprocess.run(
         ["./gradlew", "runJavaLocal"], cwd=BOTS_DIR,
-        capture_output=True, text=True, timeout=180,
+        capture_output=True, text=True,         timeout=600,
     )
     samples = []
     prev_by_id = {}
@@ -88,27 +88,56 @@ def run_match(map_name, team_a, team_b, max_rounds):
             continue
         parsed = parse_obs(line)
         if parsed:
-            state, action, value, robot_id, capture_flag = parsed
+            state, tilescores, value, robot_id, capture_flag = parsed
             if capture_flag and robot_id in prev_by_id:
                 prev_idx = prev_by_id[robot_id]
-                old_state, old_action, old_value = samples[prev_idx]
-                samples[prev_idx] = (old_state, old_action, old_value - 80)
+                old_state, old_ts, old_value = samples[prev_idx]
+                samples[prev_idx] = (old_state, old_ts, old_value - 80)
             prev_by_id[robot_id] = len(samples)
-            samples.append((state, action, value))
+            samples.append((state, tilescores, value))
     return samples
 
+CHECKPOINT = os.path.join(BOTS_DIR, "collect_checkpoint.pt")
+
 all_samples = []
+processed = set()
+if os.path.exists(CHECKPOINT):
+    ckpt = torch.load(CHECKPOINT, weights_only=True)
+    all_samples = ckpt["samples"]
+    processed = set(ckpt["maps"])
+    print(f"Resuming from checkpoint: {len(all_samples)} samples, {len(processed)} maps done", flush=True)
+
 for map_name in MAPS:
+    if map_name in processed:
+        print(f"\n--- {map_name}: SKIP (already done) ---", flush=True)
+        continue
     print(f"\n--- {map_name}: econ5 vs econ5 ---", flush=True)
     samples = run_match(map_name, "econ5", "econ5", MAX_ROUNDS)
     print(f"  {len(samples)} samples", flush=True)
     all_samples.extend(samples)
+    processed.add(map_name)
+    torch.save({"samples": all_samples, "maps": list(processed)}, CHECKPOINT)
+    print(f"  checkpoint saved", flush=True)
 
 print(f"\nTotal: {len(all_samples)} samples", flush=True)
 
 states = torch.tensor([x[0] for x in all_samples])
-actions = torch.tensor([x[1] for x in all_samples])
+tilescores = torch.tensor([x[1] for x in all_samples])
 values = torch.tensor([x[2] for x in all_samples])
 
-torch.save({"states": states, "actions": actions, "values": values}, os.path.join(BOTS_DIR, "dataset.pt"))
+torch.save({"states": states, "tilescores": tilescores, "values": values},
+           os.path.join(BOTS_DIR, "dataset.pt"))
 print(f"Dataset saved to {os.path.join(BOTS_DIR, 'dataset.pt')}", flush=True)
+
+# Filter for enemy-only samples (at least one enemy health > 0)
+enemy_mask = (states[:, 4] > 0) | (states[:, 8] > 0) | (states[:, 12] > 0)
+enemy_states = states[enemy_mask]
+enemy_tilescores = tilescores[enemy_mask]
+enemy_values = values[enemy_mask]
+print(f"Enemy-only: {enemy_mask.sum().item()} / {len(states)} samples", flush=True)
+torch.save({"states": enemy_states, "tilescores": enemy_tilescores, "values": enemy_values},
+           os.path.join(BOTS_DIR, "dataset_enemy.pt"))
+print(f"Enemy dataset saved to {os.path.join(BOTS_DIR, 'dataset_enemy.pt')}", flush=True)
+
+# Cleanup checkpoint
+os.remove(CHECKPOINT)

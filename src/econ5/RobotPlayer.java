@@ -1,13 +1,6 @@
 package econ5;
 
-import battlecode.common.Clock;
-import battlecode.common.Direction;
-import battlecode.common.GameActionException;
-import battlecode.common.MapLocation;
-import battlecode.common.RobotController;
-import battlecode.common.RobotInfo;
-import battlecode.common.Team;
-import battlecode.common.UnitType;
+import battlecode.common.*;
 
 import java.util.Random;
 
@@ -44,6 +37,18 @@ public strictfp class RobotPlayer {
             Direction.SOUTHWEST,
             Direction.WEST,
             Direction.NORTHWEST,
+    };
+
+    static final Direction[] allDirections = {
+        Direction.CENTER,
+        Direction.NORTH,
+        Direction.NORTHEAST,
+        Direction.EAST,
+        Direction.SOUTHEAST,
+        Direction.SOUTH,
+        Direction.SOUTHWEST,
+        Direction.WEST,
+        Direction.NORTHWEST,
     };
 
     static int dirToInt(Direction d) {
@@ -99,14 +104,13 @@ public strictfp class RobotPlayer {
                 Globals.carryTargetDir = 0;
                 Globals.throwTargetDir = 0;
                 double prevHealth = rc.getHealth();
-                MapLocation prevLoc = rc.getLocation();
-                Direction prevDir = rc.getDirection();
 
                 switch (rc.getType()){
                     case RAT_KING -> RatKing.run(rc);
                     case BABY_RAT -> BabyRat.run(rc);
                 }
 
+                RobotInfo[] friendlyRats = rc.senseNearbyRobots(-1, rc.getTeam());
                 int enemyCount = rc.senseNearbyRobots(-1, rc.getTeam().opponent()).length;
                 Globals.turnValue += 0.5 * enemyCount;
 
@@ -163,15 +167,22 @@ public strictfp class RobotPlayer {
                 sb.append(actionCd).append(',');
                 sb.append(carrying);
                 if (justCaptured) sb.append(",C");
-                int movedDir = prevLoc.equals(rc.getLocation()) ? 0 : prevLoc.directionTo(rc.getLocation()).ordinal();
-                int facingDir = rc.getDirection().ordinal();
-                int attackRel = Globals.attackTargetDir;
-                int carryRel = Globals.carryTargetDir;
-                int throwRel = Globals.throwTargetDir;
                 String vs = String.format("%.1f", Globals.turnValue);
-                String actions = movedDir + "," + facingDir + "," + attackRel + "," + carryRel + "," + throwRel;
-                sb.append('|').append(vs).append('|').append(actions);
-                rc.setIndicatorString(vs + "|" + actions);
+                sb.append('|').append(vs).append('|');
+                for (int i = 0; i < 9; i++) {
+                    MapLocation tile = cur.add(allDirections[i]);
+                    int ts = 0;
+                    if (i == 0 || rc.onTheMap(tile)) {
+                        try {
+                            ts = TileScore.score(rc, enemyRats, friendlyRats, tile, null, null);
+                        } catch (Exception e) {
+                            ts = 0;
+                        }
+                    }
+                    if (i > 0) sb.append(',');
+                    sb.append(ts);
+                }
+                rc.setIndicatorString(vs);
                 System.out.println(sb);
             }
             catch (GameActionException e) {
