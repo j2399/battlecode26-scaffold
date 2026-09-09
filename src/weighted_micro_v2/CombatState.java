@@ -1,13 +1,23 @@
-package prev_weighted_micro;
+package weighted_micro_v2;
 
 import battlecode.common.*;
 
 /** Active when an attackable enemy rat is in range. */
 public class CombatState extends Unit {
 
-    // TODO implement combat state 
+    // TODO implement combat state
+
+    // Diagnostics for this turn's end-of-turn debug print: which action(s)
+    // actually executed (comma-separated, in execution order) and total
+    // damage dealt this turn. Reset at the top of run(), appended to by
+    // whichever action method(s) actually fire below.
+    static String turnActions = "";
+    static int turnDamage = 0;
 
     public static void run() throws GameActionException {
+        turnActions = "";
+        turnDamage = 0;
+
         // act after moving
         int best_act_score=Integer.MIN_VALUE;
         Direction best_act_dir=Direction.NORTH;
@@ -15,33 +25,48 @@ public class CombatState extends Unit {
         int best_no_act_score=Integer.MIN_VALUE;
         Direction best__no_act_dir=Direction.NORTH;
 
+        StringBuilder noActLog = new StringBuilder();
+        StringBuilder actLog = new StringBuilder();
+
         for(Direction dir : adjacentDirections){
                 MapLocation loc=myLoc.add(dir);
                 if(rc.canMove(dir)){
                     int score=CombatTileScore.tile_score(loc, false);
+                    noActLog.append(dir).append("=").append(score).append(" ");
                     if (score>best_no_act_score){
                         best_no_act_score=score;
                         best__no_act_dir=dir;
                     }
+                } else {
+                    noActLog.append(dir).append("=x ");
                 }
             }
+
+        int[] scores = {0, 0, 0, 0};
 
         if (canAct){
              for(Direction dir : adjacentDirections){
                 MapLocation loc=myLoc.add(dir);
                 if(rc.canMove(dir)){
                     int score=CombatTileScore.tile_score(loc, true);
+                    actLog.append(dir).append("=").append(score).append(" ");
                     if (score>best_act_score){
                         best_act_score=score;
                         best_act_dir=dir;
                     }
+                } else {
+                    actLog.append(dir).append("=x ");
                 }
             }
-            int[] scores =CombatTileScore.action_score(myLoc);
-            int act_score=Math.max(scores[0],Math.max(scores[1],scores[2]));
+            scores =CombatTileScore.action_score(myLoc);
+            int act_score=Math.max(Math.max(scores[0],scores[1]),Math.max(scores[2],scores[3]));
             if(best_no_act_score+act_score>best_act_score){
                 act(scores);
                 attackMove(best__no_act_dir);
+                if(canAct){
+                    scores =CombatTileScore.action_score(myLoc);
+                    act(scores);
+                }
             }
             else{
                 attackMove(best_act_dir);
@@ -52,6 +77,13 @@ public class CombatState extends Unit {
         else{
             attackMove(best__no_act_dir);
         }
+
+        System.out.println("[combat] hp=" + rc.getHealth()
+            + " tileScoresNoAct=[" + noActLog.toString().trim() + "]"
+            + " tileScoresAct=[" + actLog.toString().trim() + "]"
+            + " actionScores(attack,trap,throw,carry)=" + java.util.Arrays.toString(scores)
+            + " action=" + (turnActions.isEmpty() ? "none" : turnActions)
+            + " damageDealt=" + turnDamage);
     }
 
     /**
@@ -73,7 +105,7 @@ public static void attackMove(Direction idealDir) throws GameActionException {
     }
     if (closest == null) return;
 
-    Direction turnDir = myLoc.directionTo(closest.getLocation());
+
     // Figure out which direction we can actually move in, falling back to
     // a 45-degree rotation off the ideal direction if it's blocked.
     Direction moveDir = null;
@@ -89,38 +121,29 @@ public static void attackMove(Direction idealDir) throws GameActionException {
         }
     }
 
-    if (moveDir != null) {
-        MapLocation destination = myLoc.add(moveDir);
-        boolean enemyNearDestination = false;
-        for (RobotInfo enemy : enemyRats) {
-            if (destination.distanceSquaredTo(enemy.getLocation()) <= 3) {
-                enemyNearDestination = true;
-                break;
-            }
-        }
-        if (!enemyNearDestination) {
-            turnDir = moveDir;
-        }
-    }
-
-    // Turn before moving.
-    if (rc.canTurn(turnDir)) {
-        rc.turn(turnDir);
-        selfDir=rc.getDirection();
-    }
     if (moveDir != null && rc.canMove(moveDir)) {
         rc.move(moveDir);
         update();
     }
+     Direction turnDir = myLoc.directionTo(closest.getLocation());
+     // Turn after moving.
+    if (rc.canTurn(turnDir)) {
+        rc.turn(turnDir);
+        selfDir=rc.getDirection();
+    }
 }
 
-    // scores is a list of 3 elements: attacking, laying a mine, and throwing
+    // scores is a list of 4 elements: attacking, laying a mine, throwing, and carrying
     public static void act(int[] scores) throws GameActionException{
         int attack_score=scores[0];
         int mine_score=scores[1];
         int throw_score=scores[2];
+        int carry_score=scores[3];
 
-        if (throw_score>=attack_score && throw_score>=mine_score){
+        if (carry_score>=attack_score && carry_score>=mine_score && carry_score>=throw_score){
+            carryBestTarget();
+        }
+        else if (throw_score>=attack_score && throw_score>=mine_score){
             throwAtBestTarget();
         }
         else if (attack_score>=mine_score){
@@ -129,6 +152,39 @@ public static void attackMove(Direction idealDir) throws GameActionException {
         else{
             placeTrapTowardClosestEnemy();
         }
+        carryBestTarget();
+        throwAtBestTarget();
+        attackHighestHealthInRange();
+    }
+
+    /**
+ * Ratnaps the highest-HP enemy rat we can legally carry. rc.canCarryRat
+ * already covers adjacency, the facing-away-or-lower-health eligibility
+ * rule, the same-robot recent-carry cooldown, and not already carrying
+ * someone, so it's the authoritative check here rather than the distance
+ * heuristics CombatTileScore uses for scoring purposes.
+ */
+    public static void carryBestTarget() throws GameActionException {
+        if (!canAct || rc.getCarrying() != null) return;
+
+        RobotInfo target = null;
+        int bestHealth = -1;
+
+        for (RobotInfo enemy : enemyRats) {
+            if (enemy.getType() != UnitType.BABY_RAT) continue;
+            if (!rc.canCarryRat(enemy.getLocation())) continue;
+
+            if (enemy.getHealth() > bestHealth) {
+                bestHealth = enemy.getHealth();
+                target = enemy;
+            }
+        }
+
+        if (target != null) {
+            rc.carryRat(target.getLocation());
+            canAct=false;
+            turnActions += (turnActions.isEmpty() ? "" : ",") + "carry";
+        }
     }
 
     /**
@@ -136,6 +192,7 @@ public static void attackMove(Direction idealDir) throws GameActionException {
  * closest enemy rat.
  */
 public static void placeTrapTowardClosestEnemy() throws GameActionException {
+    if (rc.getAllCheese()<300) return;
     RobotInfo closest = null;
     int closestDistSq = Integer.MAX_VALUE;
 
@@ -154,6 +211,7 @@ public static void placeTrapTowardClosestEnemy() throws GameActionException {
 
     if (rc.canPlaceRatTrap(trapLoc)) {
         rc.placeRatTrap(trapLoc);
+        turnActions += (turnActions.isEmpty() ? "" : ",") + "trap";
     }
 }
 
@@ -162,6 +220,29 @@ public static void placeTrapTowardClosestEnemy() throws GameActionException {
  */
 public static void attackHighestHealthInRange() throws GameActionException {
     if (!canAct) return;
+
+    RobotInfo enemyKing = null;
+    for (RobotInfo e : enemyRats) {
+            if (e.getType() == UnitType.RAT_KING) {
+                enemyKing = e;
+                break;
+            }
+        }
+    if (enemyKing != null) {
+        MapLocation atk_loc = enemyKing.getLocation().subtract(myLoc.directionTo(enemyKing.getLocation()));
+        if(rc.canAttack(atk_loc)){
+            if (rc.canTurn()) {
+                Direction face = myLoc.directionTo(enemyKing.getLocation());
+                if (face != Direction.CENTER && rc.getDirection() != face) rc.turn(face);
+            }
+            rc.attack(atk_loc);
+            canAct=false;
+            turnActions += (turnActions.isEmpty() ? "" : ",") + "attack";
+            turnDamage += GameConstants.RAT_BITE_DAMAGE;
+            return;
+        }
+    }
+
     final int MAX_DIST_SQ = 3;
 
     RobotInfo target = null;
@@ -181,6 +262,8 @@ public static void attackHighestHealthInRange() throws GameActionException {
         // TODO determine how mcuh to attack with instead of default
         rc.attack(target.getLocation());
         canAct=false;
+        turnActions += (turnActions.isEmpty() ? "" : ",") + "attack";
+        turnDamage += GameConstants.RAT_BITE_DAMAGE;
     }
 }
 
@@ -230,12 +313,14 @@ public static void attackHighestHealthInRange() throws GameActionException {
             if (rc.canThrowRat()) {
                 rc.throwRat();
                 canAct=false;
+                turnActions += (turnActions.isEmpty() ? "" : ",") + "throw";
             }
         }
         else if (selfDir==dir){
             if (rc.canThrowRat()) {
                 rc.throwRat();
                 canAct=false;
+                turnActions += (turnActions.isEmpty() ? "" : ",") + "throw";
             }
         }
     }

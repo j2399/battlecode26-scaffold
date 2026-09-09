@@ -1,4 +1,5 @@
-package prev_weighted_micro;
+package weighted_micro_v2;
+
 
 import battlecode.common.*;
 
@@ -9,14 +10,20 @@ import battlecode.common.*;
 public class RobotPlayer {
 
     public static void run(RobotController rc) throws GameActionException {
-        Unit.init(rc);
+        try {
+            Unit.init(rc);
+        }
+        catch (Exception e) {
+            System.out.println("Exception");
+            e.printStackTrace();
+        }
 
         while (true) {
             try {
                 Unit.update();
                 switch (rc.getType()) {
-                    case RAT_KING -> King.run(rc);
-                    case BABY_RAT -> Rat.run(rc);
+                    case RAT_KING -> King.run();
+                    case BABY_RAT -> Rat.run();
                     default -> {}
                 }
             } catch (GameActionException e) {

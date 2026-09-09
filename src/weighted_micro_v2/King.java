@@ -1,4 +1,4 @@
-package prev_weighted_micro;
+package weighted_micro_v2;
 
 import battlecode.common.*;
 
@@ -6,10 +6,11 @@ public class King extends Unit {
 
     // TODO inplement king logic
 
-    public static void run(RobotController rc) throws GameActionException {
+    public static void run() throws GameActionException {
         
-
+        if (rc.getAllCheese()>300){
         trySpawnRat();
+        }
     }
 
     static void trySpawnRat() throws GameActionException {
