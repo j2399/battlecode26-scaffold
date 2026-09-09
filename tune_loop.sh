@@ -50,6 +50,26 @@ run_with_timeout() {
     return $rc
 }
 
+# Resolve the claude binary explicitly rather than trusting $PATH: this
+# script runs under a plain non-interactive bash (see shebang), which never
+# sources ~/.zshrc/~/.bashrc -- so a PATH entry that only a shell startup
+# file adds (common for npm/pipx/local installs) won't be visible here even
+# though `claude` works fine in an interactive terminal.
+CLAUDE_BIN="claude"
+if ! command -v claude >/dev/null 2>&1; then
+    for candidate in "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude" "/usr/local/bin/claude"; do
+        if [[ -x "$candidate" ]]; then
+            CLAUDE_BIN="$candidate"
+            break
+        fi
+    done
+fi
+if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+    echo "[tune_loop] couldn't find the claude binary (checked \$PATH, ~/.local/bin, /opt/homebrew/bin, /usr/local/bin)." >&2
+    echo "[tune_loop] run 'which claude' in your normal terminal and pass its directory via: export PATH=\"<that dir>:\$PATH\" before running this script." >&2
+    exit 1
+fi
+
 STOP_FILE="TUNE_STOP"
 rm -f "$STOP_FILE"
 
@@ -122,7 +142,7 @@ Then stop -- the outer loop will benchmark your change next round."
         MODEL_ARGS=()
     fi
 
-    run_with_timeout 1800 claude -p "$PROMPT" \
+    run_with_timeout 1800 "$CLAUDE_BIN" -p "$PROMPT" \
         --permission-mode acceptEdits \
         --allowedTools "Read" "Edit" "Grep" "Glob" "Bash(./gradlew compileJava*)" \
         --max-budget-usd "$BUDGET" \
