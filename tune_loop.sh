@@ -35,6 +35,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# macOS ships neither GNU `timeout` nor `gtimeout` by default, so implement
+# a portable equivalent instead of depending on either being installed.
+run_with_timeout() {
+    local secs="$1"; shift
+    "$@" &
+    local pid=$!
+    ( sleep "$secs"; kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null ) &
+    local watcher=$!
+    wait "$pid" 2>/dev/null
+    local rc=$?
+    kill "$watcher" 2>/dev/null
+    wait "$watcher" 2>/dev/null
+    return $rc
+}
+
 STOP_FILE="TUNE_STOP"
 rm -f "$STOP_FILE"
 
@@ -107,7 +122,7 @@ Then stop -- the outer loop will benchmark your change next round."
         MODEL_ARGS=()
     fi
 
-    timeout 1800 claude -p "$PROMPT" \
+    run_with_timeout 1800 claude -p "$PROMPT" \
         --permission-mode acceptEdits \
         --allowedTools "Read" "Edit" "Grep" "Glob" "Bash(./gradlew compileJava*)" \
         --max-budget-usd "$BUDGET" \
