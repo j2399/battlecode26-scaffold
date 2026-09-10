@@ -1,4 +1,4 @@
-package weighted_micro;
+package weighted_micro_v16;
 
 import battlecode.common.*;
 
@@ -158,12 +158,6 @@ public static void attackMove(Direction idealDir) throws GameActionException {
         }
 
         for (int i = 0; i < order.length && turnActions.isEmpty(); i++) {
-            // A negative score means the action's own valuation judged it a
-            // bad trade (e.g. attackValue() found retaliation risk exceeds
-            // the damage dealt) -- once we've fallen through this far,
-            // taking it anyway is worse than doing nothing, so stop instead
-            // of using it as a last-resort fallback.
-            if (scores[order[i]] < 0) break;
             switch (order[i]) {
                 case 3: carryBestTarget(); break;
                 case 2: throwAtBestTarget(); break;

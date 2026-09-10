@@ -1,4 +1,4 @@
-package weighted_micro;
+package weighted_micro_v11;
 
 import battlecode.common.*;
 
@@ -135,42 +135,26 @@ public static void attackMove(Direction idealDir) throws GameActionException {
 
     // scores is a list of 4 elements: attacking, laying a mine, throwing, and carrying
     public static void act(int[] scores) throws GameActionException{
-        // Try actions in score order (ties broken carry > throw > attack >
-        // trap, matching the old priority). Each action method already
-        // guards its own legality, so when the top scorer can't actually
-        // fire this turn (e.g. trap blocked by insufficient cheese, or a
-        // tile canPlaceRatTrap rejects) we now fall through to the
-        // next-best action instead of a fixed carry->throw->attack order
-        // that used to run unconditionally afterward and could silently
-        // execute a far worse-scoring action (e.g. a low-value carry)
-        // ahead of a much better one (e.g. a high-value attack) that
-        // never got its turn.
-        int[] order = {3, 2, 0, 1}; // carry, throw, attack, trap
-        for (int i = 1; i < order.length; i++) {
-            int key = order[i];
-            int keyScore = scores[key];
-            int j = i - 1;
-            while (j >= 0 && scores[order[j]] < keyScore) {
-                order[j + 1] = order[j];
-                j--;
-            }
-            order[j + 1] = key;
-        }
+        int attack_score=scores[0];
+        int mine_score=scores[1];
+        int throw_score=scores[2];
+        int carry_score=scores[3];
 
-        for (int i = 0; i < order.length && turnActions.isEmpty(); i++) {
-            // A negative score means the action's own valuation judged it a
-            // bad trade (e.g. attackValue() found retaliation risk exceeds
-            // the damage dealt) -- once we've fallen through this far,
-            // taking it anyway is worse than doing nothing, so stop instead
-            // of using it as a last-resort fallback.
-            if (scores[order[i]] < 0) break;
-            switch (order[i]) {
-                case 3: carryBestTarget(); break;
-                case 2: throwAtBestTarget(); break;
-                case 0: attackHighestHealthInRange(); break;
-                case 1: placeTrapTowardClosestEnemy(); break;
-            }
+        if (carry_score>=attack_score && carry_score>=mine_score && carry_score>=throw_score){
+            carryBestTarget();
         }
+        else if (throw_score>=attack_score && throw_score>=mine_score){
+            throwAtBestTarget();
+        }
+        else if (attack_score>=mine_score){
+             attackHighestHealthInRange();
+        }
+        else{
+            placeTrapTowardClosestEnemy();
+        }
+        carryBestTarget();
+        throwAtBestTarget();
+        attackHighestHealthInRange();
     }
 
     /**

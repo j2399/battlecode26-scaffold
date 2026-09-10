@@ -1,4 +1,4 @@
-package weighted_micro;
+package weighted_micro_v10;
 
 import battlecode.common.*;
 
@@ -35,16 +35,8 @@ public class CombatTileScore extends Unit {
      *  HP matters more the less of it we have left. */
     private static final int LOW_HEALTH_THRESHOLD = 30;
 
-    /** Actual cheese cost gate enforced by placeTrapTowardClosestEnemy():
-     *  below this, a trap placement attempt is a guaranteed no-op, so the
-     *  score must be zeroed out rather than merely discounted -- otherwise
-     *  trap can out-score every real action and win act()'s selection while
-     *  never actually firing, wasting the whole turn. */
-    private static final int TRAP_CHEESE_COST = 300;
-
-    /** Below this much combined cheese *above* the trap's cost, discount it
-     *  further -- spending our last reserve on a trap competes with
-     *  spawning and the king's upkeep. */
+    /** Below this much combined cheese, discount a trap's 20-cheese cost --
+     *  it's competing with spawning and the king's upkeep. */
     private static final int CHEESE_SCARCE_THRESHOLD = 60;
     private static final int CHEESE_SCARCE_TRAP_DISCOUNT = 10;
 
@@ -309,14 +301,6 @@ public class CombatTileScore extends Unit {
         Direction dir = from.directionTo(closest.getLocation());
         MapLocation trapLoc = from.add(dir);
 
-        // A tile that scores well here but can't actually be trapped (already
-        // trapped, occupied, off the map, etc.) would still win act()'s
-        // comparison and get picked -- placeTrapTowardClosestEnemy() would
-        // then silently no-op, wasting the whole turn since trap out-scored
-        // every other action. Gate on real placeability the same way the
-        // cheese-cost check below does.
-        if (from.equals(myLoc) && !rc.canPlaceRatTrap(trapLoc)) return 0;
-
         // Rough trigger-probability tiers based on how close the nearest
         // enemy already is to the trap tile -- closer means more likely to
         // wander into the trigger radius soon. Capped well below 100% since
@@ -351,8 +335,7 @@ public class CombatTileScore extends Unit {
         int value = (TrapType.RAT_TRAP.damage * probabilityPercent) / 100;
 
         int totalCheese = rc.getRawCheese() + rc.getGlobalCheese();
-        if (totalCheese < TRAP_CHEESE_COST) return 0;
-        if (totalCheese < TRAP_CHEESE_COST + CHEESE_SCARCE_THRESHOLD) {
+        if (totalCheese < CHEESE_SCARCE_THRESHOLD) {
             value -= CHEESE_SCARCE_TRAP_DISCOUNT;
         }
 
@@ -382,18 +365,12 @@ public class CombatTileScore extends Unit {
      *  baseline for freeing ourselves up rather than staying tied down
      *  carrying them. */
     private static int offensiveThrowValue(MapLocation from, RobotInfo carried) {
-        // Mirrors throwAtBestTarget()'s MIN_DIST_SQ in CombatState.java: a
-        // target closer than this is never actually throwable there, so
-        // scoring it here would credit a "throw" that can't execute.
-        final int MIN_THROW_DIST_SQ = 3;
-
         int bestDistSq = Integer.MAX_VALUE;
         RobotInfo secondTarget = null;
 
         for (RobotInfo enemy : enemyRats) {
             if (enemy.getID() == carried.getID()) continue;
             int distSq = from.distanceSquaredTo(enemy.getLocation());
-            if (distSq < MIN_THROW_DIST_SQ) continue;
             if (distSq < bestDistSq) {
                 bestDistSq = distSq;
                 secondTarget = enemy;

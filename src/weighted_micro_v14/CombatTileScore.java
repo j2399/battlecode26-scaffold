@@ -1,4 +1,4 @@
-package weighted_micro;
+package weighted_micro_v14;
 
 import battlecode.common.*;
 
@@ -309,14 +309,6 @@ public class CombatTileScore extends Unit {
         Direction dir = from.directionTo(closest.getLocation());
         MapLocation trapLoc = from.add(dir);
 
-        // A tile that scores well here but can't actually be trapped (already
-        // trapped, occupied, off the map, etc.) would still win act()'s
-        // comparison and get picked -- placeTrapTowardClosestEnemy() would
-        // then silently no-op, wasting the whole turn since trap out-scored
-        // every other action. Gate on real placeability the same way the
-        // cheese-cost check below does.
-        if (from.equals(myLoc) && !rc.canPlaceRatTrap(trapLoc)) return 0;
-
         // Rough trigger-probability tiers based on how close the nearest
         // enemy already is to the trap tile -- closer means more likely to
         // wander into the trigger radius soon. Capped well below 100% since
@@ -350,6 +342,14 @@ public class CombatTileScore extends Unit {
 
         int value = (TrapType.RAT_TRAP.damage * probabilityPercent) / 100;
 
+        // Placing a trap doesn't remove any currently-adjacent threat (unlike
+        // a lethal bite or a successful ratnap) -- whoever's already next to
+        // us bites back next turn regardless of whether we trap or attack.
+        // attackValue()/carryValue() both already price that in; trapValue()
+        // needs the same discount so it isn't artificially favored over
+        // attack just because it skips this term.
+        value -= retaliationRisk(from, null);
+
         int totalCheese = rc.getRawCheese() + rc.getGlobalCheese();
         if (totalCheese < TRAP_CHEESE_COST) return 0;
         if (totalCheese < TRAP_CHEESE_COST + CHEESE_SCARCE_THRESHOLD) {
@@ -382,18 +382,12 @@ public class CombatTileScore extends Unit {
      *  baseline for freeing ourselves up rather than staying tied down
      *  carrying them. */
     private static int offensiveThrowValue(MapLocation from, RobotInfo carried) {
-        // Mirrors throwAtBestTarget()'s MIN_DIST_SQ in CombatState.java: a
-        // target closer than this is never actually throwable there, so
-        // scoring it here would credit a "throw" that can't execute.
-        final int MIN_THROW_DIST_SQ = 3;
-
         int bestDistSq = Integer.MAX_VALUE;
         RobotInfo secondTarget = null;
 
         for (RobotInfo enemy : enemyRats) {
             if (enemy.getID() == carried.getID()) continue;
             int distSq = from.distanceSquaredTo(enemy.getLocation());
-            if (distSq < MIN_THROW_DIST_SQ) continue;
             if (distSq < bestDistSq) {
                 bestDistSq = distSq;
                 secondTarget = enemy;

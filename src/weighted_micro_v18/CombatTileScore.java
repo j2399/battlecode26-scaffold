@@ -1,4 +1,4 @@
-package weighted_micro;
+package weighted_micro_v18;
 
 import battlecode.common.*;
 
@@ -382,18 +382,12 @@ public class CombatTileScore extends Unit {
      *  baseline for freeing ourselves up rather than staying tied down
      *  carrying them. */
     private static int offensiveThrowValue(MapLocation from, RobotInfo carried) {
-        // Mirrors throwAtBestTarget()'s MIN_DIST_SQ in CombatState.java: a
-        // target closer than this is never actually throwable there, so
-        // scoring it here would credit a "throw" that can't execute.
-        final int MIN_THROW_DIST_SQ = 3;
-
         int bestDistSq = Integer.MAX_VALUE;
         RobotInfo secondTarget = null;
 
         for (RobotInfo enemy : enemyRats) {
             if (enemy.getID() == carried.getID()) continue;
             int distSq = from.distanceSquaredTo(enemy.getLocation());
-            if (distSq < MIN_THROW_DIST_SQ) continue;
             if (distSq < bestDistSq) {
                 bestDistSq = distSq;
                 secondTarget = enemy;

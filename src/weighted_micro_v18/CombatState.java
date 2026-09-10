@@ -1,4 +1,4 @@
-package weighted_micro;
+package weighted_micro_v18;
 
 import battlecode.common.*;
 

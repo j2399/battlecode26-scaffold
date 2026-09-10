@@ -1,4 +1,4 @@
-package weighted_micro;
+package weighted_micro_v12;
 
 import battlecode.common.*;
 
@@ -306,16 +306,16 @@ public class CombatTileScore extends Unit {
         RobotInfo closest = findNearest(enemyRats, from);
         if (closest == null) return 0;
 
+        // An enemy already within biting range is mid-fight, not wandering
+        // toward us -- they won't step onto a freshly placed trap tile while
+        // busy attacking us, so laying one here just forgoes a guaranteed
+        // bite for a trigger that was never going to fire.
+        if (from.distanceSquaredTo(closest.getLocation()) <= GameConstants.ATTACK_DISTANCE_SQUARED) {
+            return 0;
+        }
+
         Direction dir = from.directionTo(closest.getLocation());
         MapLocation trapLoc = from.add(dir);
-
-        // A tile that scores well here but can't actually be trapped (already
-        // trapped, occupied, off the map, etc.) would still win act()'s
-        // comparison and get picked -- placeTrapTowardClosestEnemy() would
-        // then silently no-op, wasting the whole turn since trap out-scored
-        // every other action. Gate on real placeability the same way the
-        // cheese-cost check below does.
-        if (from.equals(myLoc) && !rc.canPlaceRatTrap(trapLoc)) return 0;
 
         // Rough trigger-probability tiers based on how close the nearest
         // enemy already is to the trap tile -- closer means more likely to
@@ -382,18 +382,12 @@ public class CombatTileScore extends Unit {
      *  baseline for freeing ourselves up rather than staying tied down
      *  carrying them. */
     private static int offensiveThrowValue(MapLocation from, RobotInfo carried) {
-        // Mirrors throwAtBestTarget()'s MIN_DIST_SQ in CombatState.java: a
-        // target closer than this is never actually throwable there, so
-        // scoring it here would credit a "throw" that can't execute.
-        final int MIN_THROW_DIST_SQ = 3;
-
         int bestDistSq = Integer.MAX_VALUE;
         RobotInfo secondTarget = null;
 
         for (RobotInfo enemy : enemyRats) {
             if (enemy.getID() == carried.getID()) continue;
             int distSq = from.distanceSquaredTo(enemy.getLocation());
-            if (distSq < MIN_THROW_DIST_SQ) continue;
             if (distSq < bestDistSq) {
                 bestDistSq = distSq;
                 secondTarget = enemy;
