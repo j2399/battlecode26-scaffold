@@ -69,6 +69,15 @@ public class CombatTileScore extends Unit {
      *  and for sure, unlike a trap sitting dormant until it's triggered. */
     private static final int COOP_CARRY_DISCOUNT = 15;
 
+    /** Weight for closing distance on a sighted enemy king, applied on top
+     *  of (not instead of) the generic nearest-enemy advance term below.
+     *  Killing the king wins the game outright, so once it's visible we
+     *  want that pull to dominate the generic one -- which is halved and
+     *  would otherwise chase whichever screening baby rat is closest
+     *  instead of pushing through toward the king itself. Left undivided
+     *  (vs. the generic term's /2) so it's twice as strong. */
+    private static final int KING_SEEK_WEIGHT = 1;
+
     public static int tile_score(MapLocation tile_loc, boolean can_act) throws GameActionException {
         int score = positionalValue(tile_loc);
 
@@ -128,6 +137,18 @@ public class CombatTileScore extends Unit {
             // unseen-trap risk on top of the plain distance preference.
             if (loc.distanceSquaredTo(nearestEnemy.getLocation()) <= TrapType.RAT_TRAP.triggerRadiusSquared) {
                 score -= 5;
+            }
+        }
+
+        RobotInfo enemyKing = findEnemyKing();
+        if (enemyKing != null) {
+            int distNowKing = myLoc.distanceSquaredTo(enemyKing.getLocation());
+            int distThenKing = loc.distanceSquaredTo(enemyKing.getLocation());
+            int deltaKing = distThenKing - distNowKing; // positive = farther from the king
+
+            boolean healthy = rc.getHealth() > UnitType.BABY_RAT.getHealth() / 2;
+            if (healthy) {
+                score -= deltaKing * KING_SEEK_WEIGHT;
             }
         }
 
@@ -494,6 +515,13 @@ public class CombatTileScore extends Unit {
     // ---------------------------------------------------------------
     // Shared helpers
     // ---------------------------------------------------------------
+
+    private static RobotInfo findEnemyKing() {
+        for (RobotInfo r : enemyRats) {
+            if (r.getType() == UnitType.RAT_KING) return r;
+        }
+        return null;
+    }
 
     private static RobotInfo findNearest(RobotInfo[] robots, MapLocation from) {
         RobotInfo nearest = null;
