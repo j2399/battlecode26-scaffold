@@ -42,8 +42,14 @@ HISTORY_PREFIX = "weighted_micro_v"
 HISTORY_RE = re.compile(rf"^{HISTORY_PREFIX}(\d+)$")
 
 MAPS = [
-    "evileye", "DefaultMedium", "DefaultSmall", "thunderdome",
-    "dirtpassageway", "dirtfulcat", "micromap", "knifefight",
+    # evileye, thunderdome, and knifefight are excluded: in the most
+    # thorough test run (a 6-candidate round-robin shootout), literally
+    # every pairing on those 3 maps flipped winner when team order
+    # flipped -- 0/15 order-independent results each, pure positional
+    # bias with no bot-quality signal at all. The maps kept here at
+    # least sometimes showed a trustworthy (order-independent) result.
+    "DefaultMedium", "DefaultSmall",
+    "dirtpassageway", "dirtfulcat", "micromap",
 ]
 
 
