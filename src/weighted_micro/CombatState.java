@@ -168,7 +168,7 @@ public static void attackMove(Direction idealDir) throws GameActionException {
                 case 3: carryBestTarget(); break;
                 case 2: throwAtBestTarget(); break;
                 case 0: attackHighestHealthInRange(); break;
-                case 1: placeTrapTowardClosestEnemy(); break;
+                case 1: if (scores[1] > 0) placeTrapTowardClosestEnemy(); break;
             }
         }
     }

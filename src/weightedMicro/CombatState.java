@@ -121,7 +121,7 @@ public static void moveAttack(Direction dirIdeal) throws GameActionException {
         else if (scoreAttack>=scoreMine){
              highestHealthInRangeAttack();
         }
-        else{
+        else if (scoreMine>0){
             trapTowardClosestEnemyPlace();
         }
         bestTargetCarry();

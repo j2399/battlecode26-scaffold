@@ -5,6 +5,14 @@
 **/matches
 **/client
 
+###### RL PIPELINE (large/regeneratable, not source) ######
+
+__pycache__/
+dataset.pt
+dataset_enemy.pt
+rl_replay_buffer.pt
+qnet_weights.txt
+
 ###### JAVA ######
 
 # Compiled class file

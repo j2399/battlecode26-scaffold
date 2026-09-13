@@ -44,10 +44,34 @@ public strictfp class RobotPlayer {
                     continue;
                 }
 
+                // Every rat squeaks once a round -- a cheap, omnidirectional
+                // broadcast (SQUEAK_RADIUS_SQUARED=16) heard by any teammate
+                // within range, unlike vision, which for a BABY_RAT is a
+                // narrower 90-degree cone facing wherever this robot happens
+                // to be turned (visionConeRadiusSquared=20, visionConeAngle=
+                // 90). The message content carries no information -- only
+                // its source location (read in buildState() below) matters,
+                // giving allies awareness of this robot's position even when
+                // it's outside their vision cone (e.g. behind them).
+                rc.squeak(0);
+
+                // See RatKing.java's identical line: a minimal, always-on
+                // per-turn stats line, separate from "[traj]" (which is only
+                // ever collected for one side -- see the team-mislabeling
+                // bug fix in rl_collect.py), so external tooling can read
+                // both sides' cheese/health without needing every opponent
+                // instrumented like learner_rl's own RL logging.
+                System.out.println("[stats] " + rc.getID() + "," + rc.getRoundNum() + "," + rc.getGlobalCheese() + "," + rc.getHealth());
+
                 Team opponent = rc.getTeam().opponent();
                 RobotInfo[] enemies = rc.senseNearbyRobots(-1, opponent);
 
-                MapLocation preMoveClosest = closestEnemyLoc(rc, enemies);
+                // Saved before this turn's move so the pre-move ideal-direction
+                // check below and the post-move faceClosest() can both consider
+                // every enemy seen this turn, not just whichever one was
+                // closest before we moved -- a different pre-move enemy can
+                // become the truly closest one once our own position changes.
+                RobotInfo[] preMoveEnemies = enemies;
 
                 autoActions(rc, enemies);
 
@@ -64,21 +88,39 @@ public strictfp class RobotPlayer {
 
                     rc.setIndicatorString("tile" + bestTile);
 
+                    // If the direction we're about to move in already faces the
+                    // closest enemy we saw before moving, turn+move that way in
+                    // one step -- we end up facing correctly as a byproduct of
+                    // the move, so there's no need to re-face afterward. Only
+                    // when that doesn't hold (or we can't move that way) do we
+                    // fall back to moving via the rotate cascade and figuring
+                    // out facing separately once the move (and this turn's
+                    // actions) have actually happened.
+                    boolean facedTowardMove = false;
+
                     if (bestTile > 0) {
-                        Direction d = allDirections[bestTile];
-                        if (rc.getDirection() != d && rc.canTurn(d))
-                            rc.turn(d);
-                        if (rc.isMovementReady()) {
-                            if (rc.canMove(d)) {
-                                rc.move(d);
-                            } else if (rc.canMove(d.rotateLeft())) {
-                                rc.move(d.rotateLeft());
-                            } else if (rc.canMove(d.rotateRight())) {
-                                rc.move(d.rotateRight());
-                            } else if (rc.canMove(d.rotateLeft().rotateLeft())) {
-                                rc.move(d.rotateLeft().rotateLeft());
-                            } else if (rc.canMove(d.rotateRight().rotateRight())) {
-                                rc.move(d.rotateRight().rotateRight());
+                        Direction dirIdeal = allDirections[bestTile];
+                        MapLocation myLoc = rc.getLocation();
+                        MapLocation preMoveClosestLoc = closestEnemyLoc(rc, preMoveEnemies);
+
+                        if (preMoveClosestLoc != null
+                                && myLoc.directionTo(preMoveClosestLoc) == dirIdeal
+                                && rc.isMovementReady() && rc.canMove(dirIdeal)) {
+                            if (rc.getDirection() != dirIdeal && rc.canTurn(dirIdeal))
+                                rc.turn(dirIdeal);
+                            rc.move(dirIdeal);
+                            facedTowardMove = true;
+                        } else if (rc.isMovementReady()) {
+                            if (rc.canMove(dirIdeal)) {
+                                rc.move(dirIdeal);
+                            } else if (rc.canMove(dirIdeal.rotateLeft())) {
+                                rc.move(dirIdeal.rotateLeft());
+                            } else if (rc.canMove(dirIdeal.rotateRight())) {
+                                rc.move(dirIdeal.rotateRight());
+                            } else if (rc.canMove(dirIdeal.rotateLeft().rotateLeft())) {
+                                rc.move(dirIdeal.rotateLeft().rotateLeft());
+                            } else if (rc.canMove(dirIdeal.rotateRight().rotateRight())) {
+                                rc.move(dirIdeal.rotateRight().rotateRight());
                             }
                         }
                     }
@@ -86,7 +128,9 @@ public strictfp class RobotPlayer {
                     enemies = rc.senseNearbyRobots(-1, opponent);
                     autoActions(rc, enemies);
 
-                    faceClosest(rc, enemies, preMoveClosest);
+                    if (!facedTowardMove) {
+                        faceClosest(rc, enemies, preMoveEnemies);
+                    }
                 }
 
             } catch (GameActionException e) {
@@ -123,7 +167,13 @@ public strictfp class RobotPlayer {
         return best;
     }
 
-    static void faceClosest(RobotController rc, RobotInfo[] enemies, MapLocation remembered) throws GameActionException {
+    /** Turns toward whichever enemy is closest right now, considering both
+     * the freshly-sensed post-move enemies and every enemy location saved
+     * before we moved this turn (a pre-move enemy that wasn't the closest
+     * one back then can be the closest one now that our own position has
+     * changed, so the whole saved set is checked, not just the single
+     * previous closest). */
+    static void faceClosest(RobotController rc, RobotInfo[] enemies, RobotInfo[] remembered) throws GameActionException {
         if (!rc.canTurn()) return;
 
         MapLocation myLoc = rc.getLocation();
@@ -139,10 +189,12 @@ public strictfp class RobotPlayer {
         }
 
         if (remembered != null) {
-            int d = myLoc.distanceSquaredTo(remembered);
-            if (d < bestDist) {
-                bestDist = d;
-                closest = remembered;
+            for (RobotInfo ri : remembered) {
+                int d = myLoc.distanceSquaredTo(ri.getLocation());
+                if (d < bestDist) {
+                    bestDist = d;
+                    closest = ri.getLocation();
+                }
             }
         }
 

@@ -401,6 +401,15 @@ public class RatKing extends Globals {
     public static void run(RobotController rc) throws GameActionException {
 
         try {
+            // Separate from the "[traj]" RL-training log (which only the
+            // BabyRat NN loop emits, and only ever for one side at a time --
+            // see rl_collect.py's team-mislabeling-bug fix): a minimal,
+            // always-on per-turn line so external tooling can read this
+            // team's own cheese bank and this robot's own health for BOTH
+            // sides of a match without needing every opponent package
+            // instrumented the same way as learner_rl's RL logging.
+            System.out.println("[stats] " + rc.getID() + "," + rc.getRoundNum() + "," + rc.getGlobalCheese() + "," + rc.getHealth());
+
             if (newbot){
                 cost_const = 25 + (mapHeight + mapWidth) / 10;
                 initialize_king();
