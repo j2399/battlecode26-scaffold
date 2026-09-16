@@ -1,4 +1,4 @@
-package learner_rl;
+package learner_rl_il_only;
 
 import battlecode.common.*;
 import java.util.Random;
@@ -118,7 +118,7 @@ public strictfp class RobotPlayer {
                 // ever collected for one side -- see the team-mislabeling
                 // bug fix in rl_collect.py), so external tooling can read
                 // both sides' cheese/health without needing every opponent
-                // instrumented like learner_rl's own RL logging.
+                // instrumented like learner_rl_il_only's own RL logging.
                 System.out.println("[stats] " + rc.getID() + "," + rc.getRoundNum() + "," + rc.getGlobalCheese() + "," + rc.getHealth());
 
                 boolean carriedNow = rc.isBeingCarried();

@@ -19,13 +19,15 @@ MAPS = [
     "wallsofparadis", "whatsthecatdoin", "whereisthecheese", "ZeroDay",
 ]
 MAX_ROUNDS = 100
-STATE_DIM = 18
+STATE_DIM = 40
+HIDDEN_DIM = 32  # must match rl_train.py's HIDDEN_DIM
 NUM_TILES = 9
 TEACHER_EPOCHS = 1500
 STUDENT_EPOCHS = 2250
 BATCH_SIZE = 2048
 LR = 1e-3
 MODEL_PATH = os.path.join(BOTS_DIR, "qnet.pth")
+TEACHER_MODEL_PATH = os.path.join(BOTS_DIR, "teacher.pth")  # IL-trained TeacherTileNet weights -- rl_train.py now warm-starts RL from THIS, not qnet.pth (see its build_warm_start_model)
 
 def weights_java_path(package="econ5"):
     return os.path.join(BOTS_DIR, "src", package, "QNetWeights.java")
@@ -85,25 +87,38 @@ def parse_obs(line):
     robot_id = int(raw[0])
     raw = raw[1:]
 
+    # e*/ally* second column is now bearing-in-degrees-from-north (/180.0,
+    # matching learner_rl/RobotPlayer.java's atan2(dx,dy) convention), not a
+    # raw dy offset -- the first column stays distance (/64.0, unchanged
+    # scale). See rl_train.py's SYMMETRY_ANGLE_FIELDS for how this
+    # transforms under the 4x symmetry augmentation used downstream.
     state = [
         raw[0] / 64.0,                # x
         raw[1] / 64.0,                # y
-        raw[2] / 64.0,                # e1 dx
-        raw[3] / 64.0,                # e1 dy
+        raw[2] / 64.0,                # e1 distance
+        raw[3] / 180.0,               # e1 bearing
         raw[4] / 100.0,               # e1 health
         raw[5] / 8.0,                 # e1 dir
-        raw[6] / 64.0,                # e2 dx
-        raw[7] / 64.0,                # e2 dy
+        raw[6] / 64.0,                # e2 distance
+        raw[7] / 180.0,               # e2 bearing
         raw[8] / 100.0,               # e2 health
         raw[9] / 8.0,                 # e2 dir
-        raw[10] / 64.0,               # e3 dx
-        raw[11] / 64.0,               # e3 dy
+        raw[10] / 64.0,               # e3 distance
+        raw[11] / 180.0,              # e3 bearing
         raw[12] / 100.0,              # e3 health
         raw[13] / 8.0,                # e3 dir
         raw[14] / 8.0,                # own dir
         min(raw[15], 20) / 20.0,      # move cd
         min(raw[16], 20) / 20.0,      # action cd
         raw[17],                       # carrying (0/1)
+        # Mirrors learner_rl/RobotPlayer.java's buildState() -- see
+        # econ5/RobotPlayer.java's matching state-logging block.
+        raw[18] / 100.0,               # own health
+        raw[19] / 64.0, raw[20] / 180.0, raw[21] / 100.0, raw[22] / 8.0,   # ally1
+        raw[23] / 100.0,               # localHealthSum
+        raw[24] / 64.0, raw[25] / 180.0, raw[26] / 100.0, raw[27] / 8.0,  # ally2
+        raw[28] / 64.0, raw[29] / 180.0, raw[30] / 100.0, raw[31] / 8.0,  # ally3
+        raw[32], raw[33], raw[34], raw[35], raw[36], raw[37], raw[38], raw[39],  # canMove x8
     ]
     value = float(parts[1]) if parts[1].strip() else 0.0
     tilescores = [int(x) for x in parts[2].split(",") if x.strip()]
@@ -307,19 +322,23 @@ def main():
     print(f"\n[1/2] Training teacher on {len(samples)} samples ({TEACHER_EPOCHS} epochs)...", flush=True)
     teacher, teacher_loss, t_time = train_teacher(samples, device)
     print(f"  Teacher final loss: {teacher_loss:.6f}  [{t_time:.0f}s]", flush=True)
+    torch.save(teacher.cpu().state_dict(), TEACHER_MODEL_PATH)
+    print(f"  Saved {TEACHER_MODEL_PATH} ({STATE_DIM}-dim state, 256/128/64 hidden) -- rl_train.py's RL warm-start", flush=True)
+    teacher.to(device)
 
     print(f"\n[2/2] Distilling student from teacher ({STUDENT_EPOCHS} epochs)...", flush=True)
-    student, student_loss, s_time = distill(teacher, samples, device)
+    student, student_loss, s_time = distill(teacher, samples, device, hidden_dim=HIDDEN_DIM)
     print(f"  Student final distill loss: {student_loss:.6f}  [{s_time:.0f}s]", flush=True)
 
     torch.save(student.state_dict(), MODEL_PATH)
-    print(f"  Saved qnet.pth", flush=True)
+    print(f"  Saved qnet.pth ({STATE_DIM}-dim state, {HIDDEN_DIM} hidden)", flush=True)
 
-    export_neuralnet_java(student, neuralnet_java_path("econ5"), "econ5")
-    print(f"  Exported NeuralNet.java to econ5/", flush=True)
-
-    export_neuralnet_java(student, neuralnet_java_path("learner"), "learner")
-    print(f"  Exported NeuralNet.java to learner/", flush=True)
+    # Deliberately NOT re-exporting NeuralNet.java into econ5/ or learner/
+    # this time: both packages' own buildState() still only produce the
+    # original 18-dim state, so a 40-dim NeuralNet.java would silently
+    # break them at runtime (array-length mismatch, not a compile error) --
+    # this run's only job is producing a correctly-shaped qnet.pth for
+    # rl_train.py's build_warm_start_model() to load.
 
     print(f"\n{'='*60}", flush=True)
     print(f"Done! Teacher: {t_time:.0f}s, Student: {s_time:.0f}s", flush=True)

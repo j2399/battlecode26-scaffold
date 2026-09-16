@@ -3,20 +3,16 @@ import subprocess, re, os, sys, torch
 
 BOTS_DIR = "/Users/csproj/Desktop/rbattlecode"
 MAX_ROUNDS = 100
-STATE_DIM = 18
+STATE_DIM = 40
 
+# Restricted to the mini map + the new combat-focused training maps (see
+# rl_train.py's TRAIN_MAPS) instead of the original ~40-map sweep, so the
+# imitation-learning dataset this "new learner" is distilled from comes
+# from the same maps the RL stage will actually train and be measured on.
 MAPS = [
-    "DefaultSmall", "DefaultMedium", "DefaultLarge",
-    "micromap", "tiny",
-    "5t4rv4t10n_1337", "arrows", "averyfineline", "averystrangespace",
-    "canyoudig", "cheesebottles", "cheesefarm", "cheeseguardians",
-    "closeup", "corridorofdoomanddespair", "dirtfulcat", "dirtpassageway",
-    "EscapeTheNight", "evileye", "hatefullattice", "jail", "keepout",
-    "knifefight", "mercifullattice", "Meow", "minimaze", "Nofreecheese",
-    "peaceinourtime", "pipes", "popthecork", "rift", "safelycontained",
-    "sittingducks", "starvation", "streetsofnewyork", "TheHeist",
-    "thunderdome", "toomuchcheese", "trapped", "uneruesansfin",
-    "wallsofparadis", "whatsthecatdoin", "whereisthecheese", "ZeroDay",
+    "micromap",
+    "trainingmap1", "trainingmap2", "trainingmap3", "trainingmap4",
+    "trainingmap5", "trainingmap6", "trainingmap7",
 ]
 
 def parse_obs(line):
@@ -38,25 +34,40 @@ def parse_obs(line):
     robot_id = int(raw[0])
     raw = raw[1:]
 
+    # e*/ally* second column is now bearing-in-degrees-from-north (/180.0),
+    # not a raw dy offset -- first column stays distance (/64.0). See
+    # train.py's parse_obs (identical duplicate) and rl_train.py's
+    # SYMMETRY_ANGLE_FIELDS for how this transforms under the 4x symmetry
+    # augmentation used downstream.
     state = [
         raw[0] / 64.0,
         raw[1] / 64.0,
         raw[2] / 64.0,
-        raw[3] / 64.0,
+        raw[3] / 180.0,
         raw[4] / 100.0,
         raw[5] / 8.0,
         raw[6] / 64.0,
-        raw[7] / 64.0,
+        raw[7] / 180.0,
         raw[8] / 100.0,
         raw[9] / 8.0,
         raw[10] / 64.0,
-        raw[11] / 64.0,
+        raw[11] / 180.0,
         raw[12] / 100.0,
         raw[13] / 8.0,
         raw[14] / 8.0,
         min(raw[15], 20) / 20.0,
         min(raw[16], 20) / 20.0,
         raw[17],
+        # Fields below mirror learner_rl/RobotPlayer.java's buildState() --
+        # see econ5/RobotPlayer.java's matching state-logging block for the
+        # Java-side source of these, added there so this dataset can train
+        # over the same 40-dim state learner_rl actually uses.
+        raw[18] / 100.0,               # own health
+        raw[19] / 64.0, raw[20] / 180.0, raw[21] / 100.0, raw[22] / 8.0,   # ally1
+        raw[23] / 100.0,               # localHealthSum
+        raw[24] / 64.0, raw[25] / 180.0, raw[26] / 100.0, raw[27] / 8.0,  # ally2
+        raw[28] / 64.0, raw[29] / 180.0, raw[30] / 100.0, raw[31] / 8.0,  # ally3
+        raw[32], raw[33], raw[34], raw[35], raw[36], raw[37], raw[38], raw[39],  # canMove x8
     ]
     value = float(parts[1]) if parts[1].strip() else 0.0
     tilescores = [int(x) for x in parts[2].split(",") if x.strip()]

@@ -408,7 +408,17 @@ public class RatKing extends Globals {
             // team's own cheese bank and this robot's own health for BOTH
             // sides of a match without needing every opponent package
             // instrumented the same way as learner_rl's RL logging.
-            System.out.println("[stats] " + rc.getID() + "," + rc.getRoundNum() + "," + rc.getGlobalCheese() + "," + rc.getHealth());
+            // ",K" marks this as the RAT_KING's own line -- lets Python
+            // tell king health apart from baby-rat health when reading
+            // "[stats]" (previously ambiguous; both print the identical
+            // id,round,cheese,health format). See rl_collect.py's
+            // king_and_cheese_by_round, which rl_train.py's ValueNet now
+            // uses: the deployed policy never sees king health directly
+            // (see buildState()'s comment on why it's excluded from the
+            // combat-balance signal), but the training-only value net
+            // benefits from seeing it, since king health/cheese are close
+            // to the actual win condition itself, not just a combat proxy.
+            System.out.println("[stats] " + rc.getID() + "," + rc.getRoundNum() + "," + rc.getGlobalCheese() + "," + rc.getHealth() + ",K");
 
             if (newbot){
                 cost_const = 25 + (mapHeight + mapWidth) / 10;

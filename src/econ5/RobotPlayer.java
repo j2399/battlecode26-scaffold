@@ -129,6 +129,13 @@ public strictfp class RobotPlayer {
                 int actionCd = rc.getActionCooldownTurns();
                 int carrying = rc.getCarrying() != null ? 1 : 0;
 
+                // e_x/e_y now log (distance, bearing-in-degrees-from-north)
+                // instead of raw (dx, dy) -- mirrors learner_rl/RobotPlayer.
+                // java's buildState() (see that file's comment for the
+                // bearing convention/atan2 argument order); both stay raw
+                // here (un-normalized), matching this file's existing
+                // convention of logging raw ints for train.py's parse_obs()
+                // to scale on the Python side.
                 RobotInfo[] enemyRats = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
                 int e1x = 0, e1y = 0, e1h = 0, e1d = 0;
                 int e2x = 0, e2y = 0, e2h = 0, e2d = 0;
@@ -139,17 +146,77 @@ public strictfp class RobotPlayer {
                     int d = cur.distanceSquaredTo(el);
                     int h = (int) ri.getHealth();
                     int dir = dirToInt(ri.getDirection());
+                    int dx = el.x - myX, dy = el.y - myY;
+                    int dist = (int) Math.round(Math.sqrt((double) dx * dx + (double) dy * dy));
+                    int bearing = (int) Math.round(Math.toDegrees(Math.atan2(dx, dy)));
                     if (d < best1) {
                         best3 = best2; e3x = e2x; e3y = e2y; e3h = e2h; e3d = e2d;
                         best2 = best1; e2x = e1x; e2y = e1y; e2h = e1h; e2d = e1d;
-                        best1 = d; e1x = el.x - myX; e1y = el.y - myY; e1h = h; e1d = dir;
+                        best1 = d; e1x = dist; e1y = bearing; e1h = h; e1d = dir;
                     } else if (d < best2) {
                         best3 = best2; e3x = e2x; e3y = e2y; e3h = e2h; e3d = e2d;
-                        best2 = d; e2x = el.x - myX; e2y = el.y - myY; e2h = h; e2d = dir;
+                        best2 = d; e2x = dist; e2y = bearing; e2h = h; e2d = dir;
                     } else if (d < best3) {
-                        best3 = d; e3x = el.x - myX; e3y = el.y - myY; e3h = h; e3d = dir;
+                        best3 = d; e3x = dist; e3y = bearing; e3h = h; e3d = dir;
                     }
                 }
+
+                // Nearest 3 allies (excluding self), own health, local
+                // numbers/health advantage, and canMove flags -- mirrors
+                // learner_rl/RobotPlayer.java's buildState() exactly (see
+                // that file for the reasoning behind each field), so the
+                // dataset this produces can train a model over the SAME
+                // 40-dim state learner_rl actually uses, instead of only
+                // the original 18 raw fields below. Heard-squeak-based
+                // ally awareness is deliberately not replicated here --
+                // econ5's own robots never call rc.squeak(), so there'd be
+                // nothing to hear; the visible-allies loop below is the
+                // real source of ally data either way.
+                int ownHealthInt = (int) rc.getHealth();
+                int a1 = Integer.MAX_VALUE, a2 = Integer.MAX_VALUE, a3 = Integer.MAX_VALUE;
+                int allyX = 0, allyY = 0, ally2X = 0, ally2Y = 0, ally3X = 0, ally3Y = 0;
+                int allyH = 0, ally2H = 0, ally3H = 0;
+                int allyD = 0, ally2D = 0, ally3D = 0;
+                for (RobotInfo ri : friendlyRats) {
+                    if (ri.getID() == rc.getID()) continue;
+                    MapLocation al = ri.getLocation();
+                    int d = cur.distanceSquaredTo(al);
+                    int h = (int) ri.getHealth();
+                    int dir = dirToInt(ri.getDirection());
+                    int dx = al.x - myX, dy = al.y - myY;
+                    int dist = (int) Math.round(Math.sqrt((double) dx * dx + (double) dy * dy));
+                    int bearing = (int) Math.round(Math.toDegrees(Math.atan2(dx, dy)));
+                    if (d < a1) {
+                        a3 = a2; ally3X = ally2X; ally3Y = ally2Y; ally3H = ally2H; ally3D = ally2D;
+                        a2 = a1; ally2X = allyX; ally2Y = allyY; ally2H = allyH; ally2D = allyD;
+                        a1 = d;  allyX = dist; allyY = bearing; allyH = h; allyD = dir;
+                    } else if (d < a2) {
+                        a3 = a2; ally3X = ally2X; ally3Y = ally2Y; ally3H = ally2H; ally3D = ally2D;
+                        a2 = d;  ally2X = dist; ally2Y = bearing; ally2H = h; ally2D = dir;
+                    } else if (d < a3) {
+                        a3 = d;  ally3X = dist; ally3Y = bearing; ally3H = h; ally3D = dir;
+                    }
+                }
+
+                int localHealthSum = ownHealthInt;
+                for (RobotInfo ri : friendlyRats) {
+                    if (ri.getID() == rc.getID()) continue;
+                    if (ri.getType() != UnitType.BABY_RAT) continue;
+                    localHealthSum += (int) ri.getHealth();
+                }
+                for (RobotInfo ri : enemyRats) {
+                    if (ri.getType() != UnitType.BABY_RAT) continue;
+                    localHealthSum -= (int) ri.getHealth();
+                }
+
+                int canMoveN = rc.canMove(Direction.NORTH) ? 1 : 0;
+                int canMoveNE = rc.canMove(Direction.NORTHEAST) ? 1 : 0;
+                int canMoveE = rc.canMove(Direction.EAST) ? 1 : 0;
+                int canMoveSE = rc.canMove(Direction.SOUTHEAST) ? 1 : 0;
+                int canMoveS = rc.canMove(Direction.SOUTH) ? 1 : 0;
+                int canMoveSW = rc.canMove(Direction.SOUTHWEST) ? 1 : 0;
+                int canMoveW = rc.canMove(Direction.WEST) ? 1 : 0;
+                int canMoveNW = rc.canMove(Direction.NORTHWEST) ? 1 : 0;
 
                 boolean carriedNow = rc.isBeingCarried();
                 boolean justCaptured = carriedNow && !prevCarried;
@@ -165,7 +232,14 @@ public strictfp class RobotPlayer {
                 sb.append(myDir).append(',');
                 sb.append(moveCd).append(',');
                 sb.append(actionCd).append(',');
-                sb.append(carrying);
+                sb.append(carrying).append(',');
+                sb.append(ownHealthInt).append(',');
+                sb.append(allyX).append(',').append(allyY).append(',').append(allyH).append(',').append(allyD).append(',');
+                sb.append(localHealthSum).append(',');
+                sb.append(ally2X).append(',').append(ally2Y).append(',').append(ally2H).append(',').append(ally2D).append(',');
+                sb.append(ally3X).append(',').append(ally3Y).append(',').append(ally3H).append(',').append(ally3D).append(',');
+                sb.append(canMoveN).append(',').append(canMoveNE).append(',').append(canMoveE).append(',').append(canMoveSE).append(',');
+                sb.append(canMoveS).append(',').append(canMoveSW).append(',').append(canMoveW).append(',').append(canMoveNW);
                 if (justCaptured) sb.append(",C");
                 String vs = String.format("%.1f", Globals.turnValue);
                 sb.append('|').append(vs).append('|');

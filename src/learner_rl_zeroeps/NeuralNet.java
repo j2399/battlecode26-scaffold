@@ -1,4 +1,4 @@
-package learner_rl;
+package learner_rl_zeroeps;
 
 public class NeuralNet {
     private static final int STATE_DIM = 40;

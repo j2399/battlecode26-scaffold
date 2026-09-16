@@ -45,6 +45,12 @@ WIN_RE = re.compile(r"\[server\]\s+(\S+) \([AB]\) wins \(round (\d+)\)")
 # "[stats]" exists specifically so final_team_stats() can read BOTH sides.
 STATS_RE = re.compile(r"\[stats\] (\d+),(\d+),(\d+),(\d+)")
 
+# RatKing's own "[stats]" line carries a trailing ",K" (see RatKing.java)
+# so king_and_cheese_by_round can tell it apart from a baby rat's
+# otherwise-identical line. STATS_RE.search still matches either (it
+# doesn't anchor past the 4th number), so this only needs its own check.
+KING_MARKER = ",K"
+
 
 def parse_traj_line(line: str):
     """Returns (robot_id, turn, state, action, exploratory, just_captured,
@@ -78,6 +84,87 @@ def team_sides_from_filename(log_path: Path):
     return team_a, team_b
 
 
+def opponent_hp_delta_by_round(log_path: Path, opponent_side: str):
+    """Returns {round: total_hp_delta} for `opponent_side` ('A' or 'B'),
+    computed from PER-ROBOT health deltas between consecutive rounds --
+    deliberately not a raw total-health difference. Checked directly
+    against a real log: a team's total health climbs steadily round over
+    round almost entirely from reinforcements spawning (each a fresh
+    ~100hp baby rat with a brand new robot id -- e.g. ids 12708, 12349,
+    11984, 12766 each first appearing at consecutive rounds in one real
+    match), which would get counted as "the opponent doing great" even
+    in rounds where every one of their EXISTING units is actively losing
+    a fight. Restricting to the same robot id seen in back-to-back
+    rounds isolates actual combat damage from roster-size changes: a
+    robot's first appearance contributes nothing (no prior round to
+    diff against), and a gap (robot missing a round, e.g. from dying)
+    isn't bridged into a delta either.
+
+    See final_team_stats for the same per-side "[stats]" reading
+    pattern (and its caveat: a package that doesn't print "[stats]" at
+    all, e.g. econ5_no_cheese or weighted_micro, yields an empty dict
+    here). Used for the zero-sum reward term in rl_train.py's
+    build_batch (OPPONENT_ZERO_SUM_SCALE) -- catches outcomes our own
+    hp_delta/action_value never could, since those only ever measure
+    events on OUR side (e.g. their king starving from a cheese shortage
+    our combat pressure caused shows up nowhere in what we logged, only
+    in their own health dropping)."""
+    text = log_path.read_text(errors="replace")
+    prefix = f"[{opponent_side}:"
+    health_by_robot_round = defaultdict(dict)
+    for line in text.splitlines():
+        if not line.startswith(prefix):
+            continue
+        m = STATS_RE.search(line)
+        if not m:
+            continue
+        robot_id, round_num_s, _cheese, health = (int(x) for x in m.groups())
+        health_by_robot_round[robot_id][round_num_s] = health
+
+    delta_by_round = defaultdict(float)
+    for robot_id, by_round in health_by_robot_round.items():
+        rounds = sorted(by_round.keys())
+        for prev_r, cur_r in zip(rounds, rounds[1:]):
+            if cur_r == prev_r + 1:
+                delta_by_round[cur_r] += by_round[cur_r] - by_round[prev_r]
+    return dict(delta_by_round)
+
+
+def king_and_cheese_by_round(log_path: Path, side: str):
+    """Returns {round: (king_health, cheese)} for `side` ('A' or 'B'),
+    read from that side's RatKing "[stats]" line (identified by the
+    trailing KING_MARKER -- see RatKing.java). Cheese is team-wide
+    (rc.getGlobalCheese()) so any one robot's reading of it is already
+    the team's whole bank; king health specifically needs the marker
+    since a plain "[stats]" line can't otherwise be told apart from a
+    baby rat's. Empty dict if this side's package doesn't print "[stats]"
+    at all (same caveat as opponent_hp_delta_by_round/final_team_stats),
+    or if it prints "[stats]" but not the king-marked variant (e.g. an
+    older, un-rebuilt package snapshot from before this marker existed --
+    the marker was added mid-session, so any self-checkpoint package
+    frozen before that point won't have it when playing as either side).
+
+    Used to give rl_train.py's (training-time-only) ValueNet direct
+    visibility into both kings' health and both sides' cheese -- signals
+    close to the actual win condition itself, which no single robot's own
+    buildState() carries (king health is deliberately excluded from the
+    policy's own combat-balance feature, see buildState()'s comment) and
+    which the existing team_avg/opponent_hp_delta value-net features only
+    reflect indirectly, through a noisy combat-reward proxy."""
+    text = log_path.read_text(errors="replace")
+    prefix = f"[{side}:"
+    result = {}
+    for line in text.splitlines():
+        if not line.startswith(prefix) or KING_MARKER not in line:
+            continue
+        m = STATS_RE.search(line)
+        if not m:
+            continue
+        _robot_id, round_num_s, cheese, health = (int(x) for x in m.groups())
+        result[round_num_s] = (health, cheese)
+    return result
+
+
 def collect_from_log(log_path: Path, our_team: str = LEARNER):
     """Returns (list of per-robot trajectory dicts, outcome for our_team or
     None, the match's round count or None). Any package sharing
@@ -88,7 +175,15 @@ def collect_from_log(log_path: Path, our_team: str = LEARNER):
     excluded, or its actions get collected and mislabeled with our_team's
     outcome instead of its own. Filters strictly to whichever side (A or
     B) our_team actually played as this match, determined from the log
-    filename, not just from grepping every "[traj]" line in the file."""
+    filename, not just from grepping every "[traj]" line in the file.
+
+    Each trajectory dict also carries match_id (the log file's stem,
+    unique per match -- lets build_batch regroup this otherwise-flat
+    list back into "which robots fought in the same match together",
+    needed for team-spirit reward blending) and
+    opponent_hp_delta_by_round (see opponent_hp_delta_by_round() above,
+    identical for every one of our robots in the same match, used for
+    the zero-sum reward term)."""
     team_a, team_b = team_sides_from_filename(log_path)
     if team_a == our_team:
         our_side = "A"
@@ -96,6 +191,7 @@ def collect_from_log(log_path: Path, our_team: str = LEARNER):
         our_side = "B"
     else:
         return [], None, None  # our_team wasn't actually in this match
+    opp_side = "B" if our_side == "A" else "A"
 
     text = log_path.read_text(errors="replace")
 
@@ -117,10 +213,19 @@ def collect_from_log(log_path: Path, our_team: str = LEARNER):
             robot_id, turn, state, action, exploratory, just_captured, action_value, hp_delta, logits = parsed
             by_robot[robot_id].append((turn, state, action, exploratory, just_captured, action_value, hp_delta, logits))
 
+    match_id = log_path.stem
+    opp_hp_delta = opponent_hp_delta_by_round(log_path, opp_side)
+    our_king_cheese = king_and_cheese_by_round(log_path, our_side)
+    opp_king_cheese = king_and_cheese_by_round(log_path, opp_side)
+
     trajectories = []
     for robot_id, steps in by_robot.items():
         steps.sort(key=lambda s: s[0])
-        trajectories.append({"robot_id": robot_id, "steps": steps, "outcome": outcome})
+        trajectories.append({
+            "robot_id": robot_id, "steps": steps, "outcome": outcome,
+            "match_id": match_id, "opponent_hp_delta_by_round": opp_hp_delta,
+            "our_king_cheese_by_round": our_king_cheese, "opp_king_cheese_by_round": opp_king_cheese,
+        })
     return trajectories, outcome, round_num
 
 
@@ -173,18 +278,21 @@ def final_team_stats(log_path: Path):
     return stats
 
 
-def run_batch(opponent: str, maps=None, games: int = 1):
-    """Runs learner_rl vs opponent (both orders) across maps, returns
-    (all_trajectories, list_of_outcomes_for_learner_rl, list_of_round_counts,
-    list_of_team_scores) -- the latter two parallel to outcomes, one per
-    decided match. Each team_scores entry is (our_score, opponent_score)
-    from final_team_stats (cheese*2 + total_health), or None if that
-    match's opponent package doesn't print "[stats]" and so no score could
-    be computed for it."""
+def run_batch(opponent: str, maps=None, games: int = 1, subject: str = LEARNER):
+    """Runs `subject` (learner_rl by default -- see train_exploiter in
+    rl_train.py for why this needs to be overridable: it trains a
+    separate in-memory model that has to be exported to its own package
+    and played as-is, not as learner_rl) vs opponent (both orders) across
+    maps, returns (all_trajectories, list_of_outcomes_for_subject,
+    list_of_round_counts, list_of_team_scores) -- the latter two parallel
+    to outcomes, one per decided match. Each team_scores entry is
+    (our_score, opponent_score) from final_team_stats (cheese*2 + total_
+    health), or None if that match's opponent package doesn't print
+    "[stats]" and so no score could be computed for it."""
     maps = maps or MAPS
 
     matchups_file = PROJECT_ROOT / "rl_collect_matchups.txt"
-    matchups_file.write_text(f"{LEARNER},{opponent}\n{opponent},{LEARNER}\n")
+    matchups_file.write_text(f"{subject},{opponent}\n{opponent},{subject}\n")
 
     PARALLEL_LOGS.mkdir(parents=True, exist_ok=True)
     for f in PARALLEL_LOGS.glob("*.log"):
@@ -205,14 +313,14 @@ def run_batch(opponent: str, maps=None, games: int = 1):
     round_nums = []
     team_scores = []
     for log in PARALLEL_LOGS.glob("*.log"):
-        trajs, outcome, round_num = collect_from_log(log)
+        trajs, outcome, round_num = collect_from_log(log, subject)
         all_trajectories.extend(trajs)
         if outcome is not None:
             outcomes.append(outcome)
             round_nums.append(round_num)
 
             team_a, team_b = team_sides_from_filename(log)
-            our_side = "A" if team_a == LEARNER else "B"
+            our_side = "A" if team_a == subject else "B"
             opp_side = "B" if our_side == "A" else "A"
             stats = final_team_stats(log)
             if our_side in stats and opp_side in stats:
