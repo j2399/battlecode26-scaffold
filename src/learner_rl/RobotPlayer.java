@@ -1,6 +1,7 @@
 package learner_rl;
 
 import battlecode.common.*;
+import java.util.Arrays;
 import java.util.Random;
 
 /**
@@ -26,8 +27,15 @@ public strictfp class RobotPlayer {
     // then EAST/WEST) survive both a warm-start bias fix and dual-clip PPO,
     // since neither of those touches how much data a trailing action gets
     // in the first place, only how it's weighted once collected. 0.33 cuts
-    // that gap to ~20x.
-    static final float EPSILON = 0.33f;
+    // that gap to ~20x. Lowered 0.33->0.2 to test whether the RGPS fix +
+    // count-based exploration bonus + argmax-share regularizer (all added
+    // after 0.33 was chosen, none of which existed when 0.1 was measured
+    // above) are now enough to hold the line at a smaller floor -- gap at
+    // 0.2 is ~37x, between the previously-safe 20x and the previously-
+    // unsafe 73x, genuinely untested territory rather than a known-safe
+    // value. Watch argmax_share_kl and action_freq_ema closely after this
+    // change; revert to 0.33 if either starts moving the way it did before.
+    static final float EPSILON = 0.2f;
     static Random rng;
 
     // Tracked turn-to-turn to detect getting captured (by the enemy) for
@@ -421,11 +429,32 @@ public strictfp class RobotPlayer {
         return 0f;
     }
 
+    // Inserts a new (distSq, dist, bearing, health, dir) candidate into the
+    // K parallel arrays (already sorted ascending by distSq), shifting
+    // anything farther-away right and dropping off the end -- a simple
+    // insertion sort specialized for "find the K nearest of a stream,"
+    // reused for both enemies and allies below instead of hand-writing a
+    // separate cascade of if/else-if per K (only tractable for the old
+    // K=3; doesn't scale to K=6 legibly).
+    static void insertNearest(int[] distSq, float[] dist, float[] bear, float[] health, int[] dir,
+                               int newDistSq, float newDist, float newBear, float newHealth, int newDir) {
+        int n = distSq.length;
+        if (newDistSq >= distSq[n - 1]) return;
+        int i = n - 1;
+        while (i > 0 && distSq[i - 1] > newDistSq) {
+            distSq[i] = distSq[i - 1]; dist[i] = dist[i - 1]; bear[i] = bear[i - 1];
+            health[i] = health[i - 1]; dir[i] = dir[i - 1];
+            i--;
+        }
+        distSq[i] = newDistSq; dist[i] = newDist; bear[i] = newBear; health[i] = newHealth; dir[i] = newDir;
+    }
+
+    static final int K_NEAREST = 6;
+
     static float[] buildState(RobotController rc, RobotInfo[] enemies) throws GameActionException {
         MapLocation loc = rc.getLocation();
         int myX = loc.x, myY = loc.y;
 
-        int b1 = Integer.MAX_VALUE, b2 = Integer.MAX_VALUE, b3 = Integer.MAX_VALUE;
         // e_x/e_y now hold (distance, bearing-in-degrees-from-north) instead
         // of raw (dx, dy) offsets -- see the state-layout comment on
         // buildState()'s return statement below for the normalization and
@@ -434,9 +463,10 @@ public strictfp class RobotPlayer {
         // (dx=east offset as the "y" arg, dy=north offset as the "x" arg)
         // gives 0=north, 90=east, 180/-180=south, -90=west, increasing
         // clockwise -- matches allDirections/dirToInt's ordering exactly.
-        float e1x = 0, e1y = 0, e2x = 0, e2y = 0, e3x = 0, e3y = 0;
-        float e1h = 0, e2h = 0, e3h = 0;
-        int e1d = 0, e2d = 0, e3d = 0;
+        int[] eDistSq = new int[K_NEAREST];
+        float[] eDist = new float[K_NEAREST], eBear = new float[K_NEAREST], eHealth = new float[K_NEAREST];
+        int[] eDir = new int[K_NEAREST];
+        Arrays.fill(eDistSq, Integer.MAX_VALUE);
 
         for (RobotInfo ri : enemies) {
             MapLocation el = ri.getLocation();
@@ -446,32 +476,19 @@ public strictfp class RobotPlayer {
             int dx = el.x - myX, dy = el.y - myY;
             float dist = (float) Math.sqrt((double) dx * dx + (double) dy * dy);
             float bearing = (float) Math.toDegrees(Math.atan2(dx, dy));
-            if (d < b1) {
-                b3 = b2; e3x = e2x; e3y = e2y; e3h = e2h; e3d = e2d;
-                b2 = b1; e2x = e1x; e2y = e1y; e2h = e1h; e2d = e1d;
-                b1 = d;  e1x = dist; e1y = bearing; e1h = h; e1d = dir;
-            } else if (d < b2) {
-                b3 = b2; e3x = e2x; e3y = e2y; e3h = e2h; e3d = e2d;
-                b2 = d;  e2x = dist; e2y = bearing; e2h = h; e2d = dir;
-            } else if (d < b3) {
-                b3 = d;  e3x = dist; e3y = bearing; e3h = h; e3d = dir;
-            }
+            insertNearest(eDistSq, eDist, eBear, eHealth, eDir, d, dist, bearing, h, dir);
         }
 
-        // Nearest 3 allies (excluding self), by distance -- mirrors the
-        // enemy-tracking loop above. Previously only the single nearest
-        // ally was tracked; a lone nearest-ally reading can't distinguish
-        // "I have one ally right behind me" from "I'm in the middle of a
-        // group of allies," which matters for judging whether a fight
-        // (or getting swarmed) is actually winnable. Own-health awareness
-        // was the other original gap here -- "retreat when low" or "don't
-        // overextend alone" style decisions need exactly this info and
+        // Nearest K allies (excluding self), by distance -- mirrors the
+        // enemy-tracking loop above. Own-health awareness and knowing more
+        // than just the single nearest ally both matter for judging
+        // whether a fight (or getting swarmed) is actually winnable --
         // weighted_micro's hand-written heuristic already uses both.
         RobotInfo[] allies = rc.senseNearbyRobots(-1, rc.getTeam());
-        int a1 = Integer.MAX_VALUE, a2 = Integer.MAX_VALUE, a3 = Integer.MAX_VALUE;
-        float allyX = 0, allyY = 0, ally2X = 0, ally2Y = 0, ally3X = 0, ally3Y = 0;
-        float allyH = 0, ally2H = 0, ally3H = 0;
-        int allyD = 0, ally2D = 0, ally3D = 0;
+        int[] aDistSq = new int[K_NEAREST];
+        float[] aDist = new float[K_NEAREST], aBear = new float[K_NEAREST], aHealth = new float[K_NEAREST];
+        int[] aDir = new int[K_NEAREST];
+        Arrays.fill(aDistSq, Integer.MAX_VALUE);
         for (RobotInfo ri : allies) {
             if (ri.getID() == rc.getID()) continue;
             MapLocation al = ri.getLocation();
@@ -481,16 +498,7 @@ public strictfp class RobotPlayer {
             int dx = al.x - myX, dy = al.y - myY;
             float dist = (float) Math.sqrt((double) dx * dx + (double) dy * dy);
             float bearing = (float) Math.toDegrees(Math.atan2(dx, dy));
-            if (d < a1) {
-                a3 = a2; ally3X = ally2X; ally3Y = ally2Y; ally3H = ally2H; ally3D = ally2D;
-                a2 = a1; ally2X = allyX; ally2Y = allyY; ally2H = allyH; ally2D = allyD;
-                a1 = d;  allyX = dist; allyY = bearing; allyH = h; allyD = dir;
-            } else if (d < a2) {
-                a3 = a2; ally3X = ally2X; ally3Y = ally2Y; ally3H = ally2H; ally3D = ally2D;
-                a2 = d;  ally2X = dist; ally2Y = bearing; ally2H = h; ally2D = dir;
-            } else if (d < a3) {
-                a3 = d;  ally3X = dist; ally3Y = bearing; ally3H = h; ally3D = dir;
-            }
+            insertNearest(aDistSq, aDist, aBear, aHealth, aDir, d, dist, bearing, h, dir);
         }
 
         // Also fold in allies heard (not necessarily seen) via last round's
@@ -498,7 +506,7 @@ public strictfp class RobotPlayer {
         // health/direction aren't knowable from a squeak alone (Message
         // only carries a source location), so those default to 0 for that
         // candidate exactly like "no ally at all" already does; only its
-        // position competes with the seen-allies loop above for the 3
+        // position competes with the seen-allies loop above for the K
         // nearest slots.
         Message[] heardSqueaks = rc.readSqueaks(rc.getRoundNum() - 1);
         for (Message msg : heardSqueaks) {
@@ -508,16 +516,7 @@ public strictfp class RobotPlayer {
             int dx = al.x - myX, dy = al.y - myY;
             float dist = (float) Math.sqrt((double) dx * dx + (double) dy * dy);
             float bearing = (float) Math.toDegrees(Math.atan2(dx, dy));
-            if (d < a1) {
-                a3 = a2; ally3X = ally2X; ally3Y = ally2Y; ally3H = ally2H; ally3D = ally2D;
-                a2 = a1; ally2X = allyX; ally2Y = allyY; ally2H = allyH; ally2D = allyD;
-                a1 = d;  allyX = dist; allyY = bearing; allyH = 0; allyD = 0;
-            } else if (d < a2) {
-                a3 = a2; ally3X = ally2X; ally3Y = ally2Y; ally3H = ally2H; ally3D = ally2D;
-                a2 = d;  ally2X = dist; ally2Y = bearing; ally2H = 0; ally2D = 0;
-            } else if (d < a3) {
-                a3 = d;  ally3X = dist; ally3Y = bearing; ally3H = 0; ally3D = 0;
-            }
+            insertNearest(aDistSq, aDist, aBear, aHealth, aDir, d, dist, bearing, 0, 0);
         }
 
         // Local numbers/health advantage: sum of health across every
@@ -570,36 +569,44 @@ public strictfp class RobotPlayer {
         float canMoveW = rc.canMove(Direction.WEST) ? 1.0f : 0.0f;
         float canMoveNW = rc.canMove(Direction.NORTHWEST) ? 1.0f : 0.0f;
 
-        // New fields are appended after the original 18, not inserted --
-        // keeps every existing column index (e1dx at 2, e1h at 4, etc.)
-        // stable for anything already indexing into the state by position
-        // (e.g. rl_train.py's RGPS proxy). Same reason ally2/ally3 are
-        // appended after localHealthSum rather than next to ally1 --
-        // localHealthSum already shipped at index 23 in an earlier
-        // change, so keeping it there avoids reshuffling that index too.
-        // e_x fields are now distance (still /64, same scale as before);
-        // e_y fields are now bearing-in-degrees-from-north, normalized by
-        // /180 into (-1, 1] (0=north, ~0.5=east, 1/-1=south, -0.5=west) --
-        // see the loops above. Distance is invariant under mirroring;
-        // bearing transforms under rl_train.py's apply_symmetry the same
-        // way the old (x,y) pair did, just expressed as an angle op
-        // instead of a sign flip -- see SYMMETRY_ANGLE_FIELDS there.
+        // New fields are appended after the original 40 (canMove, ending at
+        // index 39), not inserted -- keeps every existing column index
+        // (e1dist at 2, e1health at 4, etc.) stable for anything already
+        // indexing into the state by position (e.g. rl_train.py's RGPS
+        // proxy). e_x fields are distance (/64); e_y fields are bearing-in-
+        // degrees-from-north, normalized by /180 into (-1, 1] (0=north,
+        // ~0.5=east, 1/-1=south, -0.5=west) -- see the loops above. Distance
+        // is invariant under mirroring; bearing transforms under
+        // rl_train.py's apply_symmetry the same way the old (x,y) pair did,
+        // just expressed as an angle op instead of a sign flip -- see
+        // SYMMETRY_ANGLE_FIELDS there. Enemy/ally slots 4-6 (appended
+        // below, same 4-field layout as slots 1-3) widen the state from
+        // K=3 to K=6 nearest of each -- 3 was blind to anything past the
+        // closest few in a real group fight (allies flanking wide, or a
+        // 4th+ enemy already in range), collapsing genuinely different
+        // multi-unit situations onto the same 3-nearest reading.
         return new float[]{
             myX / 64.0f,
             myY / 64.0f,
-            e1x / 64.0f, e1y / 180.0f, e1h / 100.0f, e1d / 8.0f,
-            e2x / 64.0f, e2y / 180.0f, e2h / 100.0f, e2d / 8.0f,
-            e3x / 64.0f, e3y / 180.0f, e3h / 100.0f, e3d / 8.0f,
+            eDist[0] / 64.0f, eBear[0] / 180.0f, eHealth[0] / 100.0f, eDir[0] / 8.0f,
+            eDist[1] / 64.0f, eBear[1] / 180.0f, eHealth[1] / 100.0f, eDir[1] / 8.0f,
+            eDist[2] / 64.0f, eBear[2] / 180.0f, eHealth[2] / 100.0f, eDir[2] / 8.0f,
             dirToInt(rc.getDirection()) / 8.0f,
             Math.min(rc.getMovementCooldownTurns(), 20) / 20.0f,
             Math.min(rc.getActionCooldownTurns(), 20) / 20.0f,
             rc.getCarrying() != null ? 1.0f : 0.0f,
             rc.getHealth() / 100.0f,
-            allyX / 64.0f, allyY / 180.0f, allyH / 100.0f, allyD / 8.0f,
+            aDist[0] / 64.0f, aBear[0] / 180.0f, aHealth[0] / 100.0f, aDir[0] / 8.0f,
             localHealthSum / 100.0f,
-            ally2X / 64.0f, ally2Y / 180.0f, ally2H / 100.0f, ally2D / 8.0f,
-            ally3X / 64.0f, ally3Y / 180.0f, ally3H / 100.0f, ally3D / 8.0f,
+            aDist[1] / 64.0f, aBear[1] / 180.0f, aHealth[1] / 100.0f, aDir[1] / 8.0f,
+            aDist[2] / 64.0f, aBear[2] / 180.0f, aHealth[2] / 100.0f, aDir[2] / 8.0f,
             canMoveN, canMoveNE, canMoveE, canMoveSE, canMoveS, canMoveSW, canMoveW, canMoveNW,
+            eDist[3] / 64.0f, eBear[3] / 180.0f, eHealth[3] / 100.0f, eDir[3] / 8.0f,
+            eDist[4] / 64.0f, eBear[4] / 180.0f, eHealth[4] / 100.0f, eDir[4] / 8.0f,
+            eDist[5] / 64.0f, eBear[5] / 180.0f, eHealth[5] / 100.0f, eDir[5] / 8.0f,
+            aDist[3] / 64.0f, aBear[3] / 180.0f, aHealth[3] / 100.0f, aDir[3] / 8.0f,
+            aDist[4] / 64.0f, aBear[4] / 180.0f, aHealth[4] / 100.0f, aDir[4] / 8.0f,
+            aDist[5] / 64.0f, aBear[5] / 180.0f, aHealth[5] / 100.0f, aDir[5] / 8.0f,
         };
     }
 }

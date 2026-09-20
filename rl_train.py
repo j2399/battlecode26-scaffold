@@ -42,6 +42,7 @@ import random
 import re
 import shutil
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -75,7 +76,16 @@ from rl_collect import run_batch, LEARNER
 TRAIN_MAPS = [
     "micromap",
     "trainingmap1", "trainingmap2", "trainingmap3", "trainingmap4",
-    "trainingmap5", "trainingmap6", "trainingmap7",
+    "trainingmap5", "trainingmap6",
+    # trainingmap7 deliberately excluded: every match on it this session --
+    # in both training-era logs and the ckpt round-robin -- ran far longer
+    # than any other map (900-1000+ rounds vs. 100-400 elsewhere), with no
+    # clear winner in many cases even after that. Some structural property
+    # of this specific map (likely a stalemate-prone layout) rather than
+    # anything model-specific, since it showed up across every checkpoint
+    # tested. Including it was diluting each iteration's batch with mostly
+    # uninformative (no decided outcome) data and skewing per-map win-rate
+    # comparisons.
 ]
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -120,7 +130,7 @@ REPLAY_BUFFER_PATH = PROJECT_ROOT / "rl_replay_buffer.pt"  # persists collected 
 # qnet.pth was trained with the original 18, so warm-starting now needs a
 # partial weight transfer (see build_warm_start_model) rather than a
 # plain load_state_dict.
-STATE_DIM = 40
+STATE_DIM = 64
 NUM_TILES = 9
 
 # Bump any time a state field's SEMANTICS change without STATE_DIM itself
@@ -387,6 +397,35 @@ OPPONENT_ZERO_SUM_SCALE = HP_DELTA_SCALE
 # sustained drift instead of resetting its baseline every refresh.
 DAPO_KL_COEF = 0.1
 
+# IL teacher anchor: a second, FIXED KL-stability term against the
+# original IL-trained teacher (teacher.pth, loaded once at the start of
+# main() and never updated) -- distinct from DAPO_KL_COEF's reference,
+# which is an EMA that drifts along with the policy itself and so cannot
+# resist a slow, sustained decline (by design: it's meant to smooth
+# iteration-to-iteration thrashing, not anchor against multi-hundred-
+# iteration drift). Added after a full round-robin tournament across 29
+# checkpoints from a 599-iteration run found a strong negative correlation
+# (-0.90) between iteration number and win rate: the policy peaked around
+# iteration 80-100 and degraded almost monotonically for the rest of the
+# run, confirmed head-to-head (early checkpoints beat late ones ~80% of
+# the time), not just an aggregate artifact. This mirrors AlphaStar's own
+# documented fix for the identical symptom ("the agent continuously
+# forgot how to win against a previous version of itself"): weaving
+# imitation-learning distillation continuously through training, not just
+# once at warm-start. Implemented as compute_dapo_kl(model, il_teacher,
+# states) -- reuses that function as-is, since it's already generic over
+# *which* reference model it compares against, not DAPO-specific despite
+# the name.
+#
+# 0.02, a fifth of DAPO_KL_COEF: deliberately gentle and UNTUNED (no A/B
+# comparison was run before this training job) -- meant as a soft pull
+# back toward sound fundamentals, not a hard constraint that would
+# prevent the policy from ever improving past the IL teacher's own
+# (mediocre) play. If degradation still shows up in the next round-robin
+# check, raise this; if the policy seems unable to improve past early
+# checkpoints at all, lower it.
+IL_ANCHOR_COEF = 0.02
+
 # How much weight the reference snapshot keeps of itself each iteration
 # (vs. blending in the current policy) -- reference = DECAY*reference +
 # (1-DECAY)*current, applied every iteration. 0.99 means the reference's
@@ -427,6 +466,13 @@ DAPO_EMA_DECAY = 0.99
 RGPS_COEF = 0.1
 RGPS_CONF_DIST_SQ = 16.0   # enemy within ~4 tiles
 RGPS_CONF_HEALTH = 30.0   # out of 100
+# True bite-adjacency for a BABY_RAT (GameConstants.ATTACK_DISTANCE_SQUARED
+# in the engine source, confirmed directly) -- distinct from the much
+# looser RGPS_CONF_DIST_SQ above ("worth closing the gap at all"). Used
+# to stop rgps_loss unconditionally zeroing CENTER's target weight even
+# when the robot is already close enough to bite, where closing further
+# is actually wrong. See rgps_loss's docstring.
+ATTACK_DISTANCE_SQUARED = 2.0
 DIRECTION_DELTAS = torch.tensor([
     [0, 0], [0, 1], [1, 1], [1, 0], [1, -1], [0, -1], [-1, -1], [-1, 0], [-1, 1],
 ], dtype=torch.float32)
@@ -474,6 +520,39 @@ DIRECTION_BEARINGS = torch.atan2(DIRECTION_DELTAS[:, 0], DIRECTION_DELTAS[:, 1])
 # Raised 5x to put it in the same range as RGPS's contribution.
 ENTROPY_COEF = 0.05
 
+# Targets a DIFFERENT failure mode than ENTROPY_COEF above: per-sample
+# entropy measures how sharp each individual state's prediction is, but
+# says nothing about which action wins argmax *in aggregate* across many
+# states -- a policy can stay confidently spread per-state (healthy
+# entropy) while still picking the same 1-2 actions almost every time
+# (collapsed argmax), since entropy is a property of one softmax, not of
+# the population of argmax winners. Concretely observed: at iteration 100
+# of a run with a verified-NEUTRAL warm start (uniform-calibrated anchor,
+# balanced IL labels, balanced state-feature bearings -- ruled out
+# inherited bias directly), argmax(E)+argmax(W) reached 95.3% of all
+# states while entropy was still a moderate 1.67 (down from a fresh-start
+# 1.86, not collapsed). This is a self-reinforcing on-policy dynamic
+# (documented earlier for CENTER, then E/W/diagonals) that per-sample
+# entropy structurally cannot see, let alone resist -- it needs its own
+# term. See argmax_share_loss below.
+ARGMAX_SHARE_COEF = 0.1
+
+# Count-based exploration bonus: unlike ARGMAX_SHARE_COEF/ENTROPY_COEF
+# above (both correct the LOSS after imbalanced data has already been
+# collected), this attacks the self-reinforcing collapse at its actual
+# source -- the data itself. An under-sampled action's advantage
+# estimates stay noisy simply because there's little data to estimate
+# them from, which is *why* PPO's gradient barely reinforces it even
+# when it'd otherwise be reasonable; standard count-based/UCB-style
+# intrinsic motivation (add a bonus to actions taken less often recently)
+# directly compensates. Deliberately one-sided (bonus only, never a
+# penalty on over-represented actions) -- RGPS/argmax-share/entropy
+# already push back against over-concentration; this only needs to make
+# rare actions look more worth reinforcing, not punish common ones that
+# may be common because they're genuinely good.
+ACTION_FREQ_EMA_DECAY = 0.95   # slower than OPPONENT_WIN_EMA_DECAY (0.9) -- a stabler read on "how has the policy actually been behaving lately," not reactive to one noisy iteration
+COUNT_BONUS_COEF = 2.0         # roughly comparable scale to mean_advantage (typically 0.5-2 in the logs) so the bonus can actually compete for a collapsed action, not get lost in the noise
+
 
 def policy_log_probs(raw_output: torch.Tensor) -> torch.Tensor:
     """The net's 9 outputs were trained via MSE regression to match
@@ -501,7 +580,21 @@ def rgps_loss(model, states: torch.Tensor) -> torch.Tensor:
     enemy offset and each direction's own unit vector" is now computed
     directly as cos(enemy_bearing - direction_bearing), which is the exact
     same quantity (cos of the angle between the two vectors), just derived
-    from the angle instead of reconstructing dx/dy from it."""
+    from the angle instead of reconstructing dx/dy from it.
+
+    CENTER's target weight used to be unconditionally zeroed whenever this
+    fires -- an active penalty on CENTER, not a neutral one, every single
+    time a weak enemy is nearby, regardless of whether closing further
+    was actually useful. Confirmed as a real, distinct asymmetry (not just
+    the generic self-reinforcing collapse also affecting CENTER): econ5's
+    own ground-truth labels still pick CENTER ~25.7% of the time even in
+    enemy-visible states, and Version41's hand-tuned tournament (13-1 vs
+    econ5) uses it ~19% of the time -- both far above what a trained
+    policy that's collapsed CENTER to ~0% ever showed. Now only zeroed
+    when NOT already at bite range (ATTACK_DISTANCE_SQUARED); once
+    already in range, CENTER gets the same max-alignment target weight a
+    perfectly-aligned real direction would, since holding position (not
+    overshooting past the enemy) is the actually-correct move there."""
     e1dist = states[:, 2] * 64.0
     e1bearing = states[:, 3] * math.pi  # normalized angle * pi = radians
     e1h = states[:, 4] * 100.0
@@ -511,13 +604,30 @@ def rgps_loss(model, states: torch.Tensor) -> torch.Tensor:
 
     sub_states = states[confident]
     sub_bearing = e1bearing[confident]
+    sub_dist = e1dist[confident]
+    already_in_range = sub_dist ** 2 <= ATTACK_DISTANCE_SQUARED
 
     alignment = torch.cos(sub_bearing.unsqueeze(1) - DIRECTION_BEARINGS.unsqueeze(0))  # (N, 9)
-    alignment[:, 0] = 0.0  # CENTER stays neutral, as before
+    alignment[:, 0] = torch.where(already_in_range, torch.ones_like(sub_dist), torch.zeros_like(sub_dist))
     target = F.softmax(alignment * 4.0, dim=-1)  # sharpened soft target, not a hard one-hot
 
     log_probs = policy_log_probs(model(sub_states))
     return -(target * log_probs).sum(dim=-1).mean()
+
+
+def argmax_share_loss(model, states: torch.Tensor) -> torch.Tensor:
+    """KL(batch-mean prediction || uniform) -- see ARGMAX_SHARE_COEF above
+    for why this is a distinct signal from per-sample entropy. Averaging
+    the (already-standardized) softmax probabilities *across the batch*
+    gives, for each of the 9 actions, roughly "how often does this action
+    tend to win/contend for argmax" -- pushing that population-level
+    distribution toward uniform directly discourages any one or two
+    actions from dominating in aggregate, independent of how confident
+    any single state's prediction is. Zero when the batch-mean prediction
+    is exactly uniform; grows as it concentrates on fewer actions."""
+    probs = policy_log_probs(model(states)).exp()
+    mean_probs = probs.mean(dim=0)
+    return (mean_probs * (mean_probs.clamp_min(1e-8).log() + math.log(NUM_TILES))).sum()
 
 
 class ValueNet(nn.Module):
@@ -587,7 +697,18 @@ MIN_OPPONENT_SAMPLING_WEIGHT = 0.1  # keeps every opponent at least somewhat rea
 # re-enters the top N, so a later regression against it could still go
 # unnoticed for a while -- this trades one blind spot for a smaller,
 # difficulty-shaped one rather than eliminating the risk entirely.
-TOP_N_SELF_CHECKPOINTS = 30
+#
+# Cut 30->12: with the roster past 50 self-checkpoints, a genuinely hard
+# one (e.g. ckpt95 at 21% win rate for us) was only 1-of-30 weighted
+# candidates -- diluted enough that 150+ iterations of nominal "hardest-
+# first" sampling still hadn't fixed a persistent loss to a whole cluster
+# of iteration-90-to-145 checkpoints (see the best-checkpoint tournament,
+# stuck unable to beat iteration 50 through iteration 225). Concentrating
+# the same sampling budget onto fewer candidates doesn't reopen the pure-
+# self-play overfitting risk STATIC_OPPONENT_PROB was added for: that
+# 50% non-self floor is untouched, so this only concentrates pressure
+# within the self-play half of training, not the whole thing.
+TOP_N_SELF_CHECKPOINTS = 12
 
 
 def opponent_sampling_weights(opponents, win_rate_ema):
@@ -625,6 +746,15 @@ def hardest_self_checkpoints(self_checkpoints, win_rate_ema, n=TOP_N_SELF_CHECKP
 # from the start. Fix: a fixed probability of drawing a static opponent
 # regardless of roster size.
 STATIC_OPPONENT_PROB = 0.5
+
+# Goal-hit exploiters (see train_exploiter's EXPLOITER_WIN_RATE_THRESHOLD
+# early-stop) get drawn from a separate, rarely-sampled group instead of
+# the normal self_checkpoints pool -- a fresh, narrow specialist that just
+# found a real exploit would otherwise get ranked as one of the "hardest"
+# opponents by hardest_self_checkpoints and get drawn constantly, pulling
+# training toward countering that one specific trick instead of general
+# play. 0.5% still guarantees it gets exercised occasionally.
+GOAL_EXPLOITER_PROB = 0.005
 
 # NOTE: this used to also cap self_checkpoints to a rolling window of the
 # most recent MAX_SELF_CHECKPOINTS, on top of STATIC_OPPONENT_PROB above --
@@ -771,8 +901,11 @@ SYMMETRY_PERMS = {
 # scenario's true "can I move where flip_x's action space now calls east,"
 # which is the original canMoveW). Fixed here alongside the angle rewrite
 # since both needed the same kind of per-field transform table anyway.
-SYMMETRY_ANGLE_FIELDS = [3, 7, 11, 20, 25, 29]        # e1/e2/e3/ally1/ally2/ally3 bearing
-SYMMETRY_DIR_FIELDS = [5, 9, 13, 14, 22, 27, 31]      # e1d/e2d/e3d/ownDir/allyD/ally2D/ally3D
+# e4/e5/e6/ally4/ally5/ally6 (indices 40-63) appended when K widened 3->6
+# (see learner_rl/RobotPlayer.java's buildState() comment) -- same bearing/
+# dir transform rules as slots 1-3, just at their new appended indices.
+SYMMETRY_ANGLE_FIELDS = [3, 7, 11, 20, 25, 29, 41, 45, 49, 53, 57, 61]        # e1..e6/ally1..ally6 bearing
+SYMMETRY_DIR_FIELDS = [5, 9, 13, 14, 22, 27, 31, 43, 47, 51, 55, 59, 63]      # e1d..e6d/ownDir/allyD1..allyD6
 CANMOVE_START = 32   # canMoveN..canMoveNW, indices 32-39, order matches allDirections[1:]
 
 # For each transform, canmove_perm[k] gives the OLD canMove index (0-7, N=0)
@@ -1025,33 +1158,40 @@ def update_dapo_reference(reference_model, model, decay: float = DAPO_EMA_DECAY)
 
 def ppo_update(model, value_net, reference_model, policy_optimizer, value_optimizer, states, value_states, actions, advantages, value_targets, beh_probs,
                 epochs=4, clip_eps=PPO_CLIP_EPS, clip_eps_high=PPO_CLIP_EPS_HIGH,
-                dapo_coef=DAPO_KL_COEF, rgps_coef=RGPS_COEF):
+                dapo_coef=DAPO_KL_COEF, rgps_coef=RGPS_COEF,
+                il_anchor_model=None, il_anchor_coef=IL_ANCHOR_COEF,
+                argmax_share_coef=ARGMAX_SHARE_COEF):
     """Clipped PPO surrogate over `epochs` passes on this one collected
-    batch, plus the DAPO KL-stability term, the RGPS auxiliary term, and
-    an entropy bonus (see their definitions above) added to the same
-    policy loss each epoch. The ratio's denominator is the *behavior*
-    policy's probability (the actual epsilon-greedy mixture the data was
-    sampled from), not a frozen snapshot of pi_theta -- folding the
-    off-policy correction directly into the clip mechanism instead of
-    tracking two separate ratios. `advantages`/`value_targets` come from
-    build_batch's GAE computation (using value_net's weights *before*
-    this call) rather than being computed here -- the value net is then
-    fit by plain MSE regression to value_targets, the standard
-    "advantage + V(s)" target.
+    batch, plus the DAPO KL-stability term, the RGPS auxiliary term, the
+    IL-teacher anchor term, and an entropy bonus (see their definitions
+    above) added to the same policy loss each epoch. The ratio's
+    denominator is the *behavior* policy's probability (the actual
+    epsilon-greedy mixture the data was sampled from), not a frozen
+    snapshot of pi_theta -- folding the off-policy correction directly
+    into the clip mechanism instead of tracking two separate ratios.
+    `advantages`/`value_targets` come from build_batch's GAE computation
+    (using value_net's weights *before* this call) rather than being
+    computed here -- the value net is then fit by plain MSE regression to
+    value_targets, the standard "advantage + V(s)" target.
 
-    dapo_coef/rgps_coef default to the main-training constants but are
-    overridable to 0 for train_exploiter: DAPO's whole point is
-    resisting drift from a stable reference across a long, diverse
-    training run, and RGPS injects a hand-coded main-training heuristic
-    -- both actively fight an exploiter's actual job, which is
-    specializing away from the base policy as fast as possible in a
-    short, fixed window against one specific target."""
+    dapo_coef/rgps_coef/il_anchor_coef/argmax_share_coef default to the
+    main-training constants but are overridable to 0 for train_exploiter:
+    DAPO's whole point is resisting drift from a stable reference across a
+    long, diverse training run, RGPS injects a hand-coded main-training
+    heuristic, the IL anchor pulls back toward the ORIGINAL IL baseline,
+    and argmax-share pushes toward using all 9 actions roughly equally --
+    all four actively fight an exploiter's actual job, which is
+    specializing away from the base policy (often toward a narrow,
+    repeated counter-tactic) as fast as possible in a short, fixed window
+    against one specific target. il_anchor_model is None by default (no
+    anchor term at all, e.g. for train_exploiter's calls, which don't pass
+    one) -- main() passes the frozen IL teacher loaded once at startup."""
     advantage = advantages
     adv_std = advantage.std()
     if adv_std > 1e-6:
         advantage = (advantage - advantage.mean()) / (adv_std + 1e-8)
 
-    policy_loss_val, ratio_mean, kl_val, rgps_val, entropy_val = None, None, None, None, None
+    policy_loss_val, ratio_mean, kl_val, rgps_val, entropy_val, il_anchor_val, argmax_share_val = None, None, None, None, None, None, None
     for _ in range(epochs):
         log_probs = policy_log_probs(model(states))
         action_log_probs = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
@@ -1090,7 +1230,14 @@ def ppo_update(model, value_net, reference_model, policy_optimizer, value_optimi
         # above for why this is here at all. Subtracted (not added) since
         # policy_loss is being minimized but entropy is being maximized.
         entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
-        policy_loss = -dual_clipped_surr.mean() + dapo_coef * kl + rgps_coef * rgps - ENTROPY_COEF * entropy
+        if il_anchor_model is not None:
+            il_anchor_kl = compute_dapo_kl(model, il_anchor_model, states)
+        else:
+            il_anchor_kl = torch.tensor(0.0)
+        argmax_share = argmax_share_loss(model, states)
+        policy_loss = (-dual_clipped_surr.mean() + dapo_coef * kl + rgps_coef * rgps
+                       + il_anchor_coef * il_anchor_kl + argmax_share_coef * argmax_share
+                       - ENTROPY_COEF * entropy)
 
         policy_optimizer.zero_grad()
         policy_loss.backward()
@@ -1101,6 +1248,8 @@ def ppo_update(model, value_net, reference_model, policy_optimizer, value_optimi
         kl_val = kl.item()
         rgps_val = rgps.item()
         entropy_val = entropy.item()
+        il_anchor_val = il_anchor_kl.item()
+        argmax_share_val = argmax_share.item()
 
     value_loss_val = None
     for _ in range(epochs):
@@ -1111,7 +1260,7 @@ def ppo_update(model, value_net, reference_model, policy_optimizer, value_optimi
         value_optimizer.step()
         value_loss_val = value_loss.item()
 
-    return policy_loss_val, ratio_mean, value_loss_val, kl_val, rgps_val, entropy_val
+    return policy_loss_val, ratio_mean, value_loss_val, kl_val, rgps_val, entropy_val, il_anchor_val, argmax_share_val
 
 
 # train.py's export_neuralnet_java only unrolls a single hidden layer
@@ -1127,18 +1276,41 @@ def ppo_update(model, value_net, reference_model, policy_optimizer, value_optimi
 # lines) is slower for javac to compile than the old single-layer export;
 # that's an expected, inherent cost of training the bigger network, not a
 # bug -- see this session's "teacher does the RL, distill at the end" plan.
+# Constants (weight/bias literals) budgeted per partition class -- see
+# export_teacher_neuralnet_java below. Comfortably under the JVM's
+# 65535-entries-per-class-file constant pool cap, leaving margin for
+# whatever else (class/method metadata) shares that pool.
+NEURAL_NET_PARTITION_BUDGET = 45000
+
+
 def export_teacher_neuralnet_java(model: "TeacherTileNet", path, package="learner_rl", state_dim=STATE_DIM):
     """Unlike train.py's export_neuralnet_java (one big forward() method --
     fine for a single ~1500-multiply-add hidden layer), this generates ONE
-    PRIVATE STATIC METHOD PER NEURON instead of inlining everything into
-    forward(). Required, not just tidier: a fully-unrolled single method
-    for this network (40*256 + 256*128 + 128*64 + 64*9 =~ 51,800 multiply-
-    adds) generates bytecode well past the JVM's 64KB-per-method cap --
-    confirmed directly, javac rejected the naive single-method version with
-    "error: code too large". Each per-neuron method's own bytecode is
-    bounded by its fan-in (at most 256 multiply-adds, layer1->layer2 here),
-    comfortably under the cap; forward() itself just assembles arrays from
-    ~457 cheap method calls, also nowhere near the limit."""
+    STATIC METHOD PER NEURON instead of inlining everything into forward().
+    Required, not just tidier: a fully-unrolled single method for a
+    network this size generates bytecode well past the JVM's 64KB-per-
+    method cap -- confirmed directly, javac rejected the naive single-
+    method version with "error: code too large". Each per-neuron method's
+    own bytecode is bounded by its fan-in, comfortably under that cap.
+
+    A SEPARATE, unrelated JVM limit bites once the teacher gets large
+    enough (see TeacherTileNet's 900/450/225 sizing comment in train.py,
+    ~567k total weights): the constant pool is capped at 65535 entries
+    PER CLASS FILE, and every literal float weight/bias here consumes one
+    entry regardless of which method holds it -- confirmed directly,
+    javac rejected a ~567k-weight single-class version with "too many
+    constants". Neurons are therefore greedily packed into however many
+    NeuralNetPart<N>.java sibling classes (same package, package-private
+    static methods) are needed to keep each one under
+    NEURAL_NET_PARTITION_BUDGET; NeuralNet.forward() just calls across to
+    whichever partition holds each neuron. Cross-class calls within the
+    player's own package are ordinary instructions to the engine's
+    bytecode counter (no different from a same-class call) -- moot
+    anyway since this only ever runs under training's unlimited-bytecode
+    override.
+
+    (A HadamardTanh variant of this was tried and reverted -- see
+    TeacherTileNet's comment in train.py -- back to plain ReLU.)"""
     named = {n: p.data for n, p in model.named_parameters()}
     # TeacherTileNet.shared is Sequential(Linear,ReLU,Linear,ReLU,Linear,ReLU)
     # -- Linear layers sit at indices 0/2/4, matching train.py's class def.
@@ -1150,24 +1322,60 @@ def export_teacher_neuralnet_java(model: "TeacherTileNet", path, package="learne
     ]
     fmt = lambda v: f"{v:.12e}f"
 
-    with open(path, "w") as f:
-        f.write(f"package {package};\n\n")
-        f.write("public class NeuralNet {\n")
-        f.write(f"    private static final int STATE_DIM = {state_dim};\n\n")
+    # Flatten every neuron across every layer into one list, in forward-
+    # pass order, each carrying everything needed to write its own
+    # per-neuron method body.
+    neurons = []  # (layer_idx, j, prev_width, weight_row, bias_value, relu)
+    prev_width = state_dim
+    for layer_idx, (w, b, relu) in enumerate(layers):
+        out_width = w.shape[0]
+        for j in range(out_width):
+            neurons.append((layer_idx, j, prev_width, w[j], b[j].item(), relu))
+        prev_width = out_width
 
-        prev_width = state_dim
-        for layer_idx, (w, b, relu) in enumerate(layers):
-            out_width = w.shape[0]
-            for j in range(out_width):
-                f.write(f"    private static float n{layer_idx}_{j}(float[] x) {{\n")
-                f.write(f"        float v = {fmt(b[j].item())};\n")
-                for i in range(prev_width):
-                    f.write(f"        v += {fmt(w[j, i].item())} * x[{i}];\n")
+    partitions, current, current_cost = [], [], 0
+    for spec in neurons:
+        cost = spec[2] + 1  # fan_in weights + 1 bias
+        if current and current_cost + cost > NEURAL_NET_PARTITION_BUDGET:
+            partitions.append(current)
+            current, current_cost = [], 0
+        current.append(spec)
+        current_cost += cost
+    if current:
+        partitions.append(current)
+
+    part_class = lambda k: f"NeuralNetPart{k}"
+    neuron_partition = {}
+
+    # Stale partitions from a PAST export at a different (larger) size
+    # need clearing first -- confirmed directly, resizing the teacher
+    # back down from 13 partitions to 2 left the old NeuralNetPart2..12
+    # sitting in src/learner_rl/ as dead code (still gets compiled, just
+    # never called), since writing only the new partitions' files doesn't
+    # touch old ones the new count no longer needs.
+    for stale in path.parent.glob("NeuralNetPart*.java"):
+        stale.unlink()
+
+    for k, part in enumerate(partitions):
+        with open(path.parent / f"{part_class(k)}.java", "w") as f:
+            f.write(f"package {package};\n\n")
+            f.write(f"class {part_class(k)} {{\n")
+            for (layer_idx, j, prev_w, w_row, b_val, relu) in part:
+                neuron_partition[(layer_idx, j)] = k
+                f.write(f"    static float n{layer_idx}_{j}(float[] x) {{\n")
+                f.write(f"        float v = {fmt(b_val)};\n")
+                for i in range(prev_w):
+                    f.write(f"        v += {fmt(w_row[i].item())} * x[{i}];\n")
                 if relu:
                     f.write("        if (v < 0) v = 0;\n")
                 f.write("        return v;\n")
                 f.write("    }\n\n")
-            prev_width = out_width
+            f.write("}\n")
+
+    with open(path, "w") as f:
+        f.write(f"package {package};\n\n")
+        f.write("public class NeuralNet {\n")
+        f.write(f"    private static final int STATE_DIM = {state_dim};\n\n")
 
         widths = [state_dim] + [w.shape[0] for w, _, _ in layers]
         f.write("    public float[] forward(float[] in) {\n")
@@ -1176,20 +1384,36 @@ def export_teacher_neuralnet_java(model: "TeacherTileNet", path, package="learne
             out_width = widths[layer_idx + 1]
             f.write(f"        float[] h{layer_idx} = new float[{out_width}];\n")
             for j in range(out_width):
-                f.write(f"        h{layer_idx}[{j}] = n{layer_idx}_{j}({src});\n")
+                part_idx = neuron_partition[(layer_idx, j)]
+                f.write(f"        h{layer_idx}[{j}] = {part_class(part_idx)}.n{layer_idx}_{j}({src});\n")
         f.write(f"        return h{len(layers) - 1};\n")
         f.write("    }\n")
         f.write("}\n")
-    print(f"NeuralNet (teacher, 3-layer, per-neuron methods) written to {path}", flush=True)
+    print(f"NeuralNet (teacher, {len(layers)}-layer, {len(partitions)} partition classes) written to {path}", flush=True)
 
 
-def snapshot_self(model, iteration: int, name: str = None) -> str:
+def snapshot_self(model, iteration: int, name: str = None, zero_eps: bool = False, epsilon: float = None) -> str:
     """Copies learner_rl's non-generated Java files into a new frozen
     package named learner_rl_ckpt<iteration> (or `name`, if given -- see
     train_exploiter below, which reuses this for its own naming scheme),
     with this iteration's weights exported into its NeuralNet.java, and
     returns the new package name so it can be added to the opponent
-    roster."""
+    roster. zero_eps=True forces EPSILON=0 in the copy's RobotPlayer.java
+    -- for a package meant to be *evaluated* (a fair, noise-free head-to-
+    head) rather than trained against, since EPSILON=0.33 is a training-
+    exploration setting that would otherwise make a third of its moves
+    random. See evaluate_and_update_best below, the first real caller.
+    `epsilon` (mutually exclusive with zero_eps) instead overrides
+    EPSILON to any explicit value -- see train_exploiter, which needs a
+    small but nonzero rate: hard-zeroing it removed not just noise from
+    the win-rate signal but the only source of stochasticity in this
+    bot's decision rule (argmax + epsilon-greedy, not softmax sampling),
+    and a real run showed that's enough to let on-policy PPO lock into a
+    losing action with no random escape and collapse within a single
+    10-iteration phase (win rate 42.9% -> 0.0% by the end) -- the same
+    self-reinforcing collapse mechanism documented elsewhere in this file
+    for main training, just triggered here by removing EPSILON's
+    incidental role as an exploration floor against it."""
     if name is None:
         name = f"learner_rl_ckpt{iteration}"
     src_dir = PROJECT_ROOT / "src" / LEARNER
@@ -1199,8 +1423,8 @@ def snapshot_self(model, iteration: int, name: str = None) -> str:
     dest_dir.mkdir()
 
     for java_file in src_dir.glob("*.java"):
-        if java_file.name == "NeuralNet.java":
-            continue  # regenerated below with this checkpoint's own frozen weights
+        if java_file.name == "NeuralNet.java" or java_file.name.startswith("NeuralNetPart"):
+            continue  # regenerated below with this checkpoint's own frozen weights (see export_teacher_neuralnet_java's partitioning)
         text = java_file.read_text()
         # Whole-identifier replace, not just the package line: some files
         # also have an explicit same-package import (e.g. "import
@@ -1208,6 +1432,12 @@ def snapshot_self(model, iteration: int, name: str = None) -> str:
         # which needs renaming too or it'll silently point back at the
         # live learner_rl package instead of this frozen snapshot.
         text = re.sub(r"\blearner_rl\b", name, text)
+        if (zero_eps or epsilon is not None) and java_file.name == "RobotPlayer.java":
+            before = text
+            new_value = 0.0 if zero_eps else epsilon
+            text = text.replace("static final float EPSILON = 0.33f;", f"static final float EPSILON = {new_value}f;")
+            if text == before:
+                print(f"WARNING: zero_eps/epsilon set but EPSILON replace had no effect in {name}/RobotPlayer.java", flush=True)
         (dest_dir / java_file.name).write_text(text)
 
     export_teacher_neuralnet_java(model, dest_dir / "NeuralNet.java", package=name, state_dim=STATE_DIM)
@@ -1222,17 +1452,90 @@ def snapshot_self(model, iteration: int, name: str = None) -> str:
     return name
 
 
+# How often (in main training iterations) to run a cheap head-to-head
+# tournament check against the best-so-far checkpoint (see
+# evaluate_and_update_best below). Added alongside IL_ANCHOR_COEF above,
+# for the same reason: a full round-robin across 29 checkpoints from a
+# 599-iteration run found the FINAL checkpoint was one of the WORST in
+# the whole population (iteration/win-rate correlation -0.90) -- "last"
+# is not a safe proxy for "best" in this setup, so this tracks and
+# persists an actual best-so-far via periodic evaluation instead of
+# trusting wherever training happens to end. 25 is a compromise: cheap
+# enough not to dominate wall-clock (one TRAIN_MAPS-both-orders batch,
+# ~12-14 matches, similar cost to one training iteration's own
+# collection) while frequent enough to catch a decline reasonably soon
+# after it starts, not hundreds of iterations later.
+BEST_CHECKPOINT_EVAL_EVERY = 25
+BEST_MODEL_PATH = PROJECT_ROOT / "learner_rl_best.pth"
+BEST_PACKAGE_NAME = "learner_rl_best"
+
+
+def evaluate_and_update_best(model, total_iterations: int, best_name, best_iteration):
+    """Head-to-head tournament (TRAIN_MAPS, both orders, zero-epsilon on
+    both sides for a fair, noise-free comparison) between the current
+    policy and the persisted best-so-far. Promotes (overwrites
+    BEST_PACKAGE_NAME/BEST_MODEL_PATH with the current policy) only if it
+    wins a strict majority; otherwise the existing best is left alone.
+    Returns the (possibly updated) (best_name, best_iteration) to persist
+    in rl_state.json. best_name is None only on the very first call ever
+    (no prior best exists), in which case the current policy is promoted
+    unconditionally -- there's nothing yet to compare it against."""
+    wip_name = "learner_rl_eval_wip"
+    snapshot_self(model, total_iterations, name=wip_name, zero_eps=True)
+
+    if best_name is None:
+        torch.save(model.state_dict(), BEST_MODEL_PATH)
+        snapshot_self(model, total_iterations, name=BEST_PACKAGE_NAME, zero_eps=True)
+        recompile()
+        print(f"  [best-checkpoint] no prior best -- iteration {total_iterations} promoted unconditionally", flush=True)
+        shutil.rmtree(PROJECT_ROOT / "src" / wip_name)
+        return BEST_PACKAGE_NAME, total_iterations
+
+    recompile()  # wip package must be compiled before run_batch can play it
+    trajectories, outcomes, round_nums, team_scores = run_batch(best_name, maps=TRAIN_MAPS, games=1, subject=wip_name)
+    wins = sum(1 for o in outcomes if o > 0)
+    losses = len(outcomes) - wins
+    promoted = wins > losses
+    print(f"  [best-checkpoint] iteration {total_iterations} vs best (iteration {best_iteration}): "
+          f"{wins}W/{losses}L -> {'PROMOTED' if promoted else 'kept existing best'}", flush=True)
+
+    if promoted:
+        torch.save(model.state_dict(), BEST_MODEL_PATH)
+        snapshot_self(model, total_iterations, name=BEST_PACKAGE_NAME, zero_eps=True)
+        recompile()
+
+    shutil.rmtree(PROJECT_ROOT / "src" / wip_name)
+    return (BEST_PACKAGE_NAME, total_iterations) if promoted else (best_name, best_iteration)
+
+
 # How often (in main training iterations) to spawn a new exploiter, and
 # how many PPO iterations to specialize each one for before folding it
-# back into the opponent pool. Raised 15->30: the first real exploiter
-# (spawned at iteration 50) showed no trend at all across its full 15
-# iterations (8W/8L -> noisy dips as low as 6W/10L -> back to 8W/8L,
-# never breaking away from parity) -- on top of removing DAPO/RGPS above,
-# doubling the budget gives it more chances for a randomly-discovered
-# divergence (from EPSILON's exploration) to actually get reinforced
-# before this training run ends.
+# back into the opponent pool. History: 15->30 (the first real exploiter,
+# spawned at iteration 50, showed no trend across its full 15 iterations --
+# 8W/8L -> noisy dips as low as 6W/10L -> back to 8W/8L -- doubling the
+# budget was meant to give a randomly-discovered divergence more chances
+# to get reinforced) ->5 (cheaper per spawn, but too short to reliably
+# catch a real divergence) ->15 (splitting the difference: back to the
+# original budget shown above to actually trend across a run, not the
+# short 30-run one that never got a fair test at 15).
 EXPLOITER_EVERY = 50
-EXPLOITER_TRAIN_ITERS = 30
+EXPLOITER_TRAIN_ITERS = 10
+EXPLOITER_GAMES = 2  # games per map per iteration (was 1) -- halves the
+# win-rate metric's binomial noise (28 decided matches/iteration instead
+# of 14), at the cost of proportionally more match time per iteration;
+# iteration count dropped 15->10 to keep total match volume similar.
+EXPLOITER_REPLAY_CAPACITY = 150000  # steps; ~2 iterations' worth of fresh
+# exploiter data (see fresh_steps in main()'s loop for the comparable
+# per-iteration scale), so each PPO update draws on more than just the
+# single most recent noisy on-policy batch.
+EXPLOITER_REPLAY_TRAIN_STEPS = 60000
+EXPLOITER_VALUE_BURNIN_EPOCHS = 8
+EXPLOITER_EPSILON = 0.1  # was zero_eps=True (hard 0), then a real run
+# showed that removed the only exploration this bot's decision rule has
+# (argmax + epsilon-greedy) and let it collapse to a 0% win rate within
+# one 10-iteration phase -- small but nonzero keeps most of the win-rate
+# signal's fairness (vs. the original 0.33) while restoring an escape
+# hatch against on-policy lock-in.
 
 # Stop early and fold in as soon as a single iteration's win rate against
 # the target crosses this, rather than grinding the full iteration
@@ -1247,7 +1550,7 @@ EXPLOITER_TRAIN_ITERS = 30
 EXPLOITER_WIN_RATE_THRESHOLD = 0.7
 
 
-def train_exploiter(base_value_sd, target_opponent: str, exploiter_id: int, iterations: int = EXPLOITER_TRAIN_ITERS) -> str:
+def train_exploiter(base_value_sd, target_opponent: str, exploiter_id: int, iterations: int = EXPLOITER_TRAIN_ITERS) -> tuple[str, bool]:
     """AlphaStar-style dedicated exploiter: a short-lived fork, reset to
     the de-biased IL baseline (not wherever main training currently is),
     trained with the sole objective of beating `target_opponent`
@@ -1325,10 +1628,19 @@ def train_exploiter(base_value_sd, target_opponent: str, exploiter_id: int, iter
     value_optimizer = torch.optim.Adam(value_net.parameters(), lr=LR)
 
     wip_name = "learner_rl_exploiter_wip"
+    replay = None
+    hit_threshold = False
     for i in range(iterations):
-        snapshot_self(model, exploiter_id, name=wip_name)
+        # epsilon=EXPLOITER_EPSILON, not zero_eps: the default EPSILON=0.33
+        # dilutes both the win-rate this loop measures against
+        # EXPLOITER_WIN_RATE_THRESHOLD and the trajectories the PPO update
+        # below trains on with a third uniform-random moves, but hard-
+        # zeroing it (tried first) removed this bot's only source of
+        # exploration and let it collapse to a 0% win rate within one
+        # phase -- see EXPLOITER_EPSILON's comment above.
+        snapshot_self(model, exploiter_id, name=wip_name, epsilon=EXPLOITER_EPSILON)
         recompile()
-        trajectories, outcomes, round_nums, team_scores = run_batch(target_opponent, maps=TRAIN_MAPS, games=1, subject=wip_name)
+        trajectories, outcomes, round_nums, team_scores = run_batch(target_opponent, maps=TRAIN_MAPS, games=EXPLOITER_GAMES, subject=wip_name)
         wins = sum(1 for o in outcomes if o > 0)
         win_rate = wins / len(outcomes) if outcomes else 0.0
         print(f"  [exploiter {exploiter_id}] iter {i + 1}/{iterations} vs {target_opponent}: "
@@ -1336,11 +1648,34 @@ def train_exploiter(base_value_sd, target_opponent: str, exploiter_id: int, iter
         if win_rate >= EXPLOITER_WIN_RATE_THRESHOLD:
             print(f"  [exploiter {exploiter_id}] hit {win_rate:.2f} win rate >= {EXPLOITER_WIN_RATE_THRESHOLD} threshold, "
                   f"stopping early instead of training past this result", flush=True)
+            hit_threshold = True
             break
         batch = build_batch(trajectories, value_net)
         if batch is None:
             continue
-        states, value_states, actions, advantages, value_targets, beh_probs = batch
+        if replay is None:
+            # value_net was warm-started from main training's own value
+            # net (base_value_sd), which is calibrated for main's state
+            # distribution, not this much-weaker, structurally distinct
+            # IL-baseline exploiter's. Burn in a few value-only regression
+            # steps on this first batch (no policy gradient) before it's
+            # ever used for a PPO update, so the *next* iteration's
+            # build_batch call -- which computes GAE with value_net's
+            # weights as of that call -- starts from a value function
+            # that's at least seen this policy's own states once, instead
+            # of compounding a stale main-training value estimate with a
+            # brand-new on-policy update on top of it.
+            _, value_states0, _, _, value_targets0, _ = batch
+            for _ in range(EXPLOITER_VALUE_BURNIN_EPOCHS):
+                value_optimizer.zero_grad()
+                F.mse_loss(value_net(value_states0).squeeze(-1), value_targets0).backward()
+                value_optimizer.step()
+        # Accumulate into a short rolling replay buffer instead of training
+        # only on this single iteration's fresh batch -- smooths the PPO
+        # update over ~2 iterations' worth of data so one noisy batch
+        # doesn't dominate the gradient (see EXPLOITER_REPLAY_CAPACITY).
+        replay = batch if replay is None else append_to_replay(replay, batch, EXPLOITER_REPLAY_CAPACITY)
+        states, value_states, actions, advantages, value_targets, beh_probs = sample_from_replay(replay, EXPLOITER_REPLAY_TRAIN_STEPS)
         # dapo_coef/rgps_coef=0: DAPO's stability pull and RGPS's hand-
         # coded heuristic are both main-training-specific and actively
         # work against an exploiter's actual job (see this function's
@@ -1349,16 +1684,23 @@ def train_exploiter(base_value_sd, target_opponent: str, exploiter_id: int, iter
         # dapo_coef=0 they no longer influence the loss at all.
         ppo_update(model, value_net, reference_model, policy_optimizer, value_optimizer,
                    states, value_states, actions, advantages, value_targets, beh_probs, epochs=4,
-                   dapo_coef=0.0, rgps_coef=0.0)
+                   dapo_coef=0.0, rgps_coef=0.0, il_anchor_coef=0.0, argmax_share_coef=0.0)
         update_dapo_reference(reference_model, model)
 
     name = f"learner_rl_exploiter{exploiter_id}"
-    snapshot_self(model, exploiter_id, name=name)
+    # zero_eps=True (not EXPLOITER_EPSILON): this is a single, one-time
+    # final export, not part of the iterative training loop above, so
+    # the collapse risk that motivates EXPLOITER_EPSILON there doesn't
+    # apply here. This package is folded permanently into the main
+    # opponent roster, so it should play its sharpest, fully specialized
+    # strategy every time it's drawn, not keep taking random moves.
+    snapshot_self(model, exploiter_id, name=name, zero_eps=True)
     wip_dir = PROJECT_ROOT / "src" / wip_name
     if wip_dir.exists():
         shutil.rmtree(wip_dir)  # scratch package, not needed once the permanent name exists
-    print(f"  [exploiter {exploiter_id}] specialized against {target_opponent}, folded in as {name}", flush=True)
-    return name
+    print(f"  [exploiter {exploiter_id}] specialized against {target_opponent}, folded in as {name}"
+          f"{' (hit goal threshold)' if hit_threshold else ''}", flush=True)
+    return name, hit_threshold
 
 
 def recompile():
@@ -1374,8 +1716,17 @@ def load_state():
     if STATE_PATH.exists():
         state = json.loads(STATE_PATH.read_text())
         state.setdefault("opponent_win_rate", {})
+        state.setdefault("best_checkpoint_name", None)
+        state.setdefault("best_checkpoint_iteration", None)
+        state.setdefault("action_freq_ema", [1.0 / NUM_TILES] * NUM_TILES)
+        state.setdefault("goal_exploiters", [])
         return state
-    return {"total_iterations": 0, "self_checkpoints": [], "opponent_win_rate": {}}
+    return {
+        "total_iterations": 0, "self_checkpoints": [], "opponent_win_rate": {},
+        "best_checkpoint_name": None, "best_checkpoint_iteration": None,
+        "action_freq_ema": [1.0 / NUM_TILES] * NUM_TILES,
+        "goal_exploiters": [],
+    }
 
 
 def save_state(state):
@@ -1406,29 +1757,60 @@ def save_state(state):
 # action -- CENTER highest, then W, then the rest -- and any net trained
 # via MSE against it inherits some version of that, which self-reinforcing
 # on-policy RL can then run away with if left uncorrected at warm-start).
-# Now applies to TeacherTileNet's output (RL trains the teacher directly --
-# see TEACHER_IL_MODEL_PATH/build_warm_start_model below), NOT
-# StudentTileNet's -- a from-scratch measurement was required, the old
-# small-student constants don't transfer. Measured directly (forward
-# teacher.pth over the freshly-recollected, polar-coordinate
-# dataset_enemy.pt, 15156 enemy-filtered samples): mean Q [C,N,NE,E,SE,S,
-# SW,W,NW] = [272.4, 160.6, 133.7, 168.7, 145.8, 166.7, 159.0, 185.2,
-# 127.4], overall mean 168.82. Confirms this session's earlier finding
-# generalizes: the small student's raw argmax(CENTER) share was 66.5% on
-# the OLD (dx,dy) dataset, a large amplification over econ5's own ~24-26%
-# label rate -- this teacher's raw argmax(CENTER) share on the NEW (polar)
-# dataset is 31.3%, much closer to econ5's own 25.7% label rate, i.e. the
-# extra capacity genuinely amplifies the inherited bias far less than the
-# small student did. Recentering this measurement (subtract the 9-action
-# mean from each) still doesn't perfectly recover econ5's own per-action
-# argmax distribution afterward (CENTER undershoots to 2.7%, NW/SE
-# overshoot to 15-20%) -- the same "flat mean-shift isn't a real fix for a
-# collapsed/uneven per-action *variance*, only for the *mean*" limitation
-# discussed earlier this session. Left as-is here since this constant only
-# sets the RL warm-start point, not the final policy -- PPO/entropy/DAPO/
-# RGPS are what actually shape the trained, state-conditional action
-# distribution from there.
-ACTION_BIAS_CORRECTION = [103.56, -8.25, -35.14, -0.14, -22.99, -2.09, -9.85, 16.38, -41.47]
+#
+# Superseded the old mean-recentering version of this constant (subtract
+# the 9-action mean Q from each) after a 500-iteration run built on top of
+# it (with IL_ANCHOR_COEF continuously pulling the live policy back toward
+# build_warm_start_model()'s output every iteration) collapsed onto the
+# diagonals instead of CENTER: argmax(diagonal) went 77.4% at the anchor
+# itself -> 98.5% by iteration 75 -> 98.9% by iteration 140, with SW alone
+# reaching 56%. Root cause: the old constant only zeroed the *mean* Q
+# across actions, which the file's own prior comment already flagged as
+# insufficient ("doesn't perfectly recover econ5's own per-action argmax
+# distribution... CENTER undershoots to 2.7%, NW/SE overshoot to 15-20%")
+# -- a flat mean doesn't imply a flat *argmax* share when per-action
+# variance also differs. This version instead directly calibrates argmax
+# share: starting from raw teacher.pth's output over dataset_enemy.pt,
+# iteratively nudges each action's bias by its (count - target) error
+# until every one of the 9 actions is argmax for an equal share of states
+# (see calibrate_bias_correction.py in git history) -- actually equalized,
+# not just mean-shifted. This is also, unlike the old constant, the anchor
+# IL_ANCHOR_COEF's KL term pulls the live policy toward every iteration
+# (build_warm_start_model() serves both roles) -- so it now anchors
+# toward "no inherent directional preference", not toward whatever
+# leftover skew a pure mean-shift happened to leave in place.
+#
+# Recalibrated for the STATE_DIM 40->64 change (nearest-3 -> nearest-6
+# enemies/allies): a from-scratch measurement was required since a new IL
+# teacher was trained on the wider state -- the old constant's values are
+# specific to the old 40-dim teacher's output distribution, not portable.
+#
+# Recalibrated AGAIN after a Hadamard-tanh architecture experiment (see
+# TeacherTileNet's comment in train.py) was tried and reverted back to
+# plain ReLU -- the Hadamard-tanh teacher's raw outputs had collapsed to
+# near-total cross-action correlation (~1.000, effectively one shared
+# signal plus tiny offsets), which made this calibration itself fail to
+# converge (oscillated, never settled) rather than just producing a bad
+# result -- a useful tell in hindsight that the underlying network had a
+# real problem, not just this constant.
+#
+# Recalibrated a third time for the 900/450/225 (~9.7x param count)
+# teacher -- a from-scratch measurement was required again since this is
+# a differently-shaped network with its own raw output distribution, not
+# a portable correction. Measured directly against teacher.pth/
+# dataset_enemy.pt (13157 samples), converged cleanly to within
+# ~11.10-11.12% per action (same clean convergence as the pre-Hadamard
+# ReLU network, unlike the collapsed Hadamard-tanh attempt above --
+# confirms the bigger ReLU network didn't reintroduce that failure mode).
+#
+# Recalibrated a fourth time after reverting 900/450/225 back down to
+# 256/128/64 -- the bigger teacher made self-play matches themselves
+# ~4.2x slower (it's what every robot calls every turn DURING training,
+# not just an offline learning cost), for no benefit this run actually
+# needed once ARGMAX_SHARE_COEF was handling the collapse directly. Back
+# to the original-sized teacher's own output distribution, so back to a
+# from-scratch measurement again.
+ACTION_BIAS_CORRECTION = [30.34, -11.09, -2.57, -2.76, -7.63, 8.68, 26.40, -16.51, -24.85]
 
 
 def build_warm_start_model(state_dim: int = STATE_DIM) -> TeacherTileNet:
@@ -1583,17 +1965,30 @@ def main():
     # falls back to a fresh teacher warm-start, same as any other mismatch.
     if MODEL_PATH.exists():
         saved = torch.load(MODEL_PATH, weights_only=True, map_location="cpu")
-        if saved["shared.0.weight"].shape == (256, STATE_DIM):
+        saved_w = saved.get("shared.0.weight")
+        if saved_w is not None and saved_w.shape == (256, STATE_DIM):
             model = TeacherTileNet(STATE_DIM)
             model.load_state_dict(saved)
             print(f"Loaded existing RL checkpoint from {MODEL_PATH}")
         else:
-            print(f"Existing checkpoint's dims (state={saved['shared.0.weight'].shape[1]}, hidden0={saved['shared.0.weight'].shape[0]}) "
-                  f"don't match current teacher shape (state={STATE_DIM}, hidden0=256) -- warm-starting fresh instead.")
+            print(f"Existing checkpoint's dims don't match current teacher shape "
+                  f"(state={STATE_DIM}, hidden0=256) -- warm-starting fresh instead.")
             model = build_warm_start_model(STATE_DIM)
     else:
         model = build_warm_start_model(STATE_DIM)
         print(f"Warm-started from imitation-learned teacher weights at {TEACHER_IL_MODEL_PATH}")
+
+    # Frozen IL-teacher anchor for ppo_update's il_anchor_coef term (see
+    # IL_ANCHOR_COEF above) -- a SECOND, independent copy of the same
+    # bias-corrected warm-start point `model` began from, never updated
+    # after this. Deliberately the bias-corrected version (not raw
+    # teacher.pth) so the anchor's implied "ideal" distribution matches
+    # what the policy was actually steered toward at initialization,
+    # rather than pulling it back toward a differently-biased target.
+    il_teacher_anchor = build_warm_start_model(STATE_DIM)
+    for p in il_teacher_anchor.parameters():
+        p.requires_grad_(False)
+    il_teacher_anchor.eval()
 
     value_net = ValueNet(VALUE_STATE_DIM, hidden=HIDDEN_DIM)
     value_saved = torch.load(VALUE_MODEL_PATH, weights_only=True, map_location="cpu") if VALUE_MODEL_PATH.exists() else None
@@ -1613,13 +2008,14 @@ def main():
     # "derive one from the current policy."
     reference_model = TeacherTileNet(STATE_DIM)
     reference_saved = torch.load(REFERENCE_MODEL_PATH, weights_only=True, map_location="cpu") if REFERENCE_MODEL_PATH.exists() else None
-    if reference_saved is not None and reference_saved["shared.0.weight"].shape == (256, STATE_DIM):
+    reference_saved_w = reference_saved.get("shared.0.weight") if reference_saved is not None else None
+    if reference_saved_w is not None and reference_saved_w.shape == (256, STATE_DIM):
         reference_model.load_state_dict(reference_saved)
         print(f"Loaded existing DAPO reference snapshot from {REFERENCE_MODEL_PATH}")
     else:
         if reference_saved is not None:
-            print(f"Existing DAPO reference's dims (state={reference_saved['shared.0.weight'].shape[1]}, hidden0={reference_saved['shared.0.weight'].shape[0]}) "
-                  f"don't match current teacher shape -- reinitializing it from the current policy instead.")
+            print("Existing DAPO reference's dims don't match current teacher shape "
+                  "-- reinitializing it from the current policy instead.")
         reference_model.load_state_dict(model.state_dict())
         torch.save(reference_model.state_dict(), REFERENCE_MODEL_PATH)
         print("Initialized DAPO reference snapshot from the starting policy")
@@ -1633,6 +2029,10 @@ def main():
     total_iterations = state["total_iterations"]
     self_checkpoints = state["self_checkpoints"]
     opponent_win_rate = state["opponent_win_rate"]
+    best_checkpoint_name = state["best_checkpoint_name"]
+    best_checkpoint_iteration = state["best_checkpoint_iteration"]
+    action_freq_ema = state["action_freq_ema"]
+    goal_exploiters = state["goal_exploiters"]
     replay_buffer = load_replay_buffer()
     print(f"Replay buffer: {len(replay_buffer[0])} steps carried over", flush=True)
 
@@ -1640,14 +2040,28 @@ def main():
         total_iterations += 1
         if args.opponent:
             opponent = args.opponent
+        elif goal_exploiters and random.random() < GOAL_EXPLOITER_PROB:
+            opponent = random.choice(goal_exploiters)
         elif not self_checkpoints or random.random() < STATIC_OPPONENT_PROB:
             weights = opponent_sampling_weights(STATIC_OPPONENTS, opponent_win_rate)
             opponent = random.choices(STATIC_OPPONENTS, weights=weights)[0]
         else:
             pool = hardest_self_checkpoints(self_checkpoints, opponent_win_rate)
+            # Always-guaranteed, not just periodic: TOP_N_SELF_CHECKPOINTS
+            # ranks purely by EMA win rate, so the actual best-tracked
+            # checkpoint (the one the final distillation depends on) could
+            # silently drop out of the pool if its measured win rate isn't
+            # currently among the worst -- exactly the risk that let the
+            # policy go 175+ iterations without ever facing iteration 50
+            # again. Appended after ranking, not folded into it, so it
+            # doesn't distort hardest_self_checkpoints' own selection.
+            if best_checkpoint_name is not None and best_checkpoint_name not in pool:
+                pool = pool + [best_checkpoint_name]
             weights = opponent_sampling_weights(pool, opponent_win_rate)
             opponent = random.choices(pool, weights=weights)[0]
+        t_match_start = time.perf_counter()
         trajectories, outcomes, round_nums, team_scores = run_batch(opponent, maps=TRAIN_MAPS, games=args.games)
+        match_time = time.perf_counter() - t_match_start
         wins = sum(1 for o in outcomes if o > 0)
 
         # Rolling win-rate estimate per opponent, used to weight static-
@@ -1668,22 +2082,48 @@ def main():
         # folded into the replay buffer and training draws from the
         # buffer as a whole (see REPLAY_CAPACITY/REPLAY_TRAIN_STEPS
         # above), not just from what was collected this iteration.
+        t_nn_start = time.perf_counter()
         fresh_batch = build_batch(trajectories, value_net)
         if fresh_batch is None:
             print("  no usable steps this iteration, skipping update", flush=True)
+            nn_time = time.perf_counter() - t_nn_start
         else:
             replay_buffer = append_to_replay(replay_buffer, fresh_batch, REPLAY_CAPACITY)
             save_replay_buffer(replay_buffer)
 
+            # EMA'd on THIS iteration's fresh, genuinely-on-policy actions
+            # (not the replay-sampled training batch below, which mixes
+            # in older data) -- the most current read available on how
+            # the live policy is actually behaving right now.
+            fresh_actions = fresh_batch[2]
+            if len(fresh_actions) > 0:
+                fresh_counts = torch.bincount(fresh_actions, minlength=NUM_TILES).float()
+                fresh_freq = (fresh_counts / fresh_counts.sum()).tolist()
+                action_freq_ema = [ACTION_FREQ_EMA_DECAY * old + (1 - ACTION_FREQ_EMA_DECAY) * new
+                                    for old, new in zip(action_freq_ema, fresh_freq)]
+
             states, value_states, actions, advantages, value_targets, beh_probs = sample_from_replay(replay_buffer, REPLAY_TRAIN_STEPS)
-            policy_loss, ratio_mean, value_loss, kl, rgps, entropy = ppo_update(
+            # Count-based exploration bonus (see ACTION_FREQ_EMA_DECAY/
+            # COUNT_BONUS_COEF above): added directly to the advantage of
+            # whichever action was actually taken at each step, so a
+            # currently-rare action looks more worth reinforcing to PPO's
+            # surrogate objective -- attacks the data-starvation side of
+            # the collapse dynamic, not just the loss side.
+            freq_tensor = torch.tensor(action_freq_ema)
+            action_bonus = (COUNT_BONUS_COEF * (1.0 / NUM_TILES - freq_tensor)).clamp(min=0.0)
+            advantages = advantages + action_bonus[actions]
+            policy_loss, ratio_mean, value_loss, kl, rgps, entropy, il_anchor_kl, argmax_share = ppo_update(
                 model, value_net, reference_model, policy_optimizer, value_optimizer,
                 states, value_states, actions, advantages, value_targets, beh_probs, epochs=args.ppo_epochs,
+                il_anchor_model=il_teacher_anchor,
             )
+            nn_time = time.perf_counter() - t_nn_start
             print(f"  fresh_steps={len(fresh_batch[0])} replay_buffer={len(replay_buffer[0])} train_steps={len(states)} "
                   f"policy_loss={policy_loss:.4f} value_loss={value_loss:.4f} "
                   f"mean_advantage={advantages.mean().item():.3f} mean_ratio={ratio_mean:.3f} "
-                  f"dapo_kl={kl:.4f} rgps_loss={rgps:.4f} entropy={entropy:.4f}", flush=True)
+                  f"dapo_kl={kl:.4f} rgps_loss={rgps:.4f} il_anchor_kl={il_anchor_kl:.4f} "
+                  f"argmax_share_kl={argmax_share:.4f} entropy={entropy:.4f} "
+                  f"action_freq_ema={['%.3f' % f for f in action_freq_ema]}", flush=True)
 
             torch.save(model.state_dict(), MODEL_PATH)
             torch.save(value_net.state_dict(), VALUE_MODEL_PATH)
@@ -1711,31 +2151,78 @@ def main():
         # either can be used in the next iteration's collection batch. The
         # exploiter spawn below needs its target (LEARNER's own live
         # package) freshly compiled too, so this has to happen first.
+        t_compile_start = time.perf_counter()
         recompile()
+        compile_time = time.perf_counter() - t_compile_start
+        # match_time = actual Battlecode matches (run_batch, real game
+        # simulation across TRAIN_MAPS); nn_time = build_batch (GAE) +
+        # ppo_update (the actual forward/backward passes and gradient
+        # steps) + saving/exporting weights; compile_time = javac
+        # recompiling learner_rl (and any new checkpoint) via gradlew.
+        # Added directly to answer "how much of an iteration is the
+        # network itself vs. playing out the games" -- not obvious from
+        # the existing per-iteration prints, which had no timing at all.
+        print(f"  timing: match={match_time:.1f}s nn={nn_time:.1f}s compile={compile_time:.1f}s "
+              f"total={match_time + nn_time + compile_time:.1f}s", flush=True)
 
         if total_iterations % EXPLOITER_EVERY == 0:
-            exploiter_name = train_exploiter(value_net.state_dict(), LEARNER, total_iterations)
-            self_checkpoints.append(exploiter_name)
+            exploiter_name, exploiter_hit_goal = train_exploiter(value_net.state_dict(), LEARNER, total_iterations)
+            if exploiter_hit_goal:
+                # A goal-hit exploiter found a genuine exploit against a
+                # fixed target, not just "trained the full budget without
+                # finding much" -- but it's a narrow specialist, and
+                # hardest_self_checkpoints ranks purely by how badly we're
+                # currently losing to something, so mixing it into
+                # self_checkpoints would make it dominate the ranking (a
+                # freshly-hard opponent) and get drawn constantly, pulling
+                # training toward countering one specific trick instead of
+                # general play. GOAL_EXPLOITER_PROB gives it a rare,
+                # deliberate check instead.
+                goal_exploiters.append(exploiter_name)
+            else:
+                self_checkpoints.append(exploiter_name)
             recompile()  # covers the new exploiterN package train_exploiter just wrote
+
+        if total_iterations % BEST_CHECKPOINT_EVAL_EVERY == 0:
+            best_checkpoint_name, best_checkpoint_iteration = evaluate_and_update_best(
+                model, total_iterations, best_checkpoint_name, best_checkpoint_iteration)
+
         save_state({
             "total_iterations": total_iterations,
             "self_checkpoints": self_checkpoints,
             "opponent_win_rate": opponent_win_rate,
+            "best_checkpoint_name": best_checkpoint_name,
+            "best_checkpoint_iteration": best_checkpoint_iteration,
+            "action_freq_ema": action_freq_ema,
+            "goal_exploiters": goal_exploiters,
         })
 
-    # Final step: distill the RL-trained teacher down to the small,
-    # single-hidden-layer student that can actually run within the real
-    # game's bytecode budget (see HIDDEN_DIM's comment -- the teacher only
-    # ever ran under training's unlimited-bytecode override). Uses the
-    # accumulated replay buffer as the state sample -- states the trained
-    # policy actually visited, not the original econ5 IL dataset -- and
-    # overwrites learner_rl's live NeuralNet.java (until now holding the
-    # teacher) with this small student, which is what actually gets
-    # deployed/submitted.
+    # Final step: distill down to the small, single-hidden-layer student
+    # that can actually run within the real game's bytecode budget (see
+    # HIDDEN_DIM's comment -- the teacher only ever ran under training's
+    # unlimited-bytecode override). Distills from the BEST-TRACKED
+    # checkpoint (see evaluate_and_update_best/BEST_MODEL_PATH above), not
+    # blindly from wherever the final iteration happens to land -- the
+    # whole reason that tracking exists is the round-robin finding that
+    # the final iteration of the previous run was one of the WORST
+    # checkpoints in its own population (iteration/win-rate correlation
+    # -0.90). Falls back to the final `model` only if no best was ever
+    # recorded (e.g. a run shorter than BEST_CHECKPOINT_EVAL_EVERY).
+    # Uses the accumulated replay buffer as the state sample -- states the
+    # trained policy actually visited, not the original econ5 IL dataset.
+    distill_source = model
+    if best_checkpoint_name is not None and BEST_MODEL_PATH.exists():
+        distill_source = TeacherTileNet(STATE_DIM)
+        distill_source.load_state_dict(torch.load(BEST_MODEL_PATH, weights_only=True, map_location="cpu"))
+        print(f"\nDistilling from the best-tracked checkpoint (iteration {best_checkpoint_iteration}), "
+              f"not the final iteration ({total_iterations}) -- see BEST_CHECKPOINT_EVAL_EVERY above.", flush=True)
+    else:
+        print(f"\nNo best-tracked checkpoint recorded -- distilling from the final iteration ({total_iterations}) instead.", flush=True)
+
     if len(replay_buffer[0]) > 0:
-        print(f"\nDistilling final teacher policy to small student (KL, {DISTILL_STUDENT_EPOCHS} epochs, "
+        print(f"Distilling to small student (KL, {DISTILL_STUDENT_EPOCHS} epochs, "
               f"{len(replay_buffer[0])} states)...", flush=True)
-        student = distill_to_student_kl(model, replay_buffer[0])
+        student = distill_to_student_kl(distill_source, replay_buffer[0])
         torch.save(student.state_dict(), DISTILLED_STUDENT_PATH)
         export_neuralnet_java(student, PROJECT_ROOT / "src" / LEARNER / "NeuralNet.java", package=LEARNER, state_dim=STATE_DIM, hidden=HIDDEN_DIM)
         recompile()

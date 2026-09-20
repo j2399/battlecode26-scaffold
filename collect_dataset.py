@@ -3,7 +3,7 @@ import subprocess, re, os, sys, torch
 
 BOTS_DIR = "/Users/csproj/Desktop/rbattlecode"
 MAX_ROUNDS = 100
-STATE_DIM = 40
+STATE_DIM = 64
 
 # Restricted to the mini map + the new combat-focused training maps (see
 # rl_train.py's TRAIN_MAPS) instead of the original ~40-map sweep, so the
@@ -12,7 +12,10 @@ STATE_DIM = 40
 MAPS = [
     "micromap",
     "trainingmap1", "trainingmap2", "trainingmap3", "trainingmap4",
-    "trainingmap5", "trainingmap6", "trainingmap7",
+    "trainingmap5", "trainingmap6",
+    # trainingmap7 excluded -- see rl_train.py's TRAIN_MAPS comment (every
+    # match on it ran far longer than any other map, often with no
+    # decided winner, across every checkpoint tested).
 ]
 
 def parse_obs(line):
@@ -61,13 +64,22 @@ def parse_obs(line):
         # Fields below mirror learner_rl/RobotPlayer.java's buildState() --
         # see econ5/RobotPlayer.java's matching state-logging block for the
         # Java-side source of these, added there so this dataset can train
-        # over the same 40-dim state learner_rl actually uses.
+        # over the same 64-dim state learner_rl actually uses.
         raw[18] / 100.0,               # own health
         raw[19] / 64.0, raw[20] / 180.0, raw[21] / 100.0, raw[22] / 8.0,   # ally1
         raw[23] / 100.0,               # localHealthSum
         raw[24] / 64.0, raw[25] / 180.0, raw[26] / 100.0, raw[27] / 8.0,  # ally2
         raw[28] / 64.0, raw[29] / 180.0, raw[30] / 100.0, raw[31] / 8.0,  # ally3
         raw[32], raw[33], raw[34], raw[35], raw[36], raw[37], raw[38], raw[39],  # canMove x8
+        # Appended enemy/ally slots 4-6 (K widened 3->6, see learner_rl/
+        # RobotPlayer.java's buildState() comment) -- same layout as
+        # slots 1-3 above, just tacked on after the original 40 fields.
+        raw[40] / 64.0, raw[41] / 180.0, raw[42] / 100.0, raw[43] / 8.0,  # enemy4
+        raw[44] / 64.0, raw[45] / 180.0, raw[46] / 100.0, raw[47] / 8.0,  # enemy5
+        raw[48] / 64.0, raw[49] / 180.0, raw[50] / 100.0, raw[51] / 8.0,  # enemy6
+        raw[52] / 64.0, raw[53] / 180.0, raw[54] / 100.0, raw[55] / 8.0,  # ally4
+        raw[56] / 64.0, raw[57] / 180.0, raw[58] / 100.0, raw[59] / 8.0,  # ally5
+        raw[60] / 64.0, raw[61] / 180.0, raw[62] / 100.0, raw[63] / 8.0,  # ally6
     ]
     value = float(parts[1]) if parts[1].strip() else 0.0
     tilescores = [int(x) for x in parts[2].split(",") if x.strip()]

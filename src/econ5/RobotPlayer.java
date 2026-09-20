@@ -2,6 +2,7 @@ package econ5;
 
 import battlecode.common.*;
 
+import java.util.Arrays;
 import java.util.Random;
 
 
@@ -65,6 +66,25 @@ public strictfp class RobotPlayer {
             default:         return 0;
         }
     }
+
+    // Same K-nearest insertion helper as learner_rl/RobotPlayer.java's
+    // buildState() -- see that file's comment. Int-typed here to match
+    // this file's existing convention of logging raw ints for train.py's
+    // parse_obs() to scale on the Python side.
+    static void insertNearest(int[] distSq, int[] dist, int[] bear, int[] health, int[] dir,
+                               int newDistSq, int newDist, int newBear, int newHealth, int newDir) {
+        int n = distSq.length;
+        if (newDistSq >= distSq[n - 1]) return;
+        int i = n - 1;
+        while (i > 0 && distSq[i - 1] > newDistSq) {
+            distSq[i] = distSq[i - 1]; dist[i] = dist[i - 1]; bear[i] = bear[i - 1];
+            health[i] = health[i - 1]; dir[i] = dir[i - 1];
+            i--;
+        }
+        distSq[i] = newDistSq; dist[i] = newDist; bear[i] = newBear; health[i] = newHealth; dir[i] = newDir;
+    }
+
+    static final int K_NEAREST = 6;
 
     /**
      * run() is the method that is called when a robot is instantiated in the Battlecode world.
@@ -137,10 +157,10 @@ public strictfp class RobotPlayer {
                 // convention of logging raw ints for train.py's parse_obs()
                 // to scale on the Python side.
                 RobotInfo[] enemyRats = rc.senseNearbyRobots(-1, rc.getTeam().opponent());
-                int e1x = 0, e1y = 0, e1h = 0, e1d = 0;
-                int e2x = 0, e2y = 0, e2h = 0, e2d = 0;
-                int e3x = 0, e3y = 0, e3h = 0, e3d = 0;
-                int best1 = Integer.MAX_VALUE, best2 = Integer.MAX_VALUE, best3 = Integer.MAX_VALUE;
+                int[] eDistSq = new int[K_NEAREST];
+                int[] eDist = new int[K_NEAREST], eBear = new int[K_NEAREST], eHealth = new int[K_NEAREST];
+                int[] eDir = new int[K_NEAREST];
+                Arrays.fill(eDistSq, Integer.MAX_VALUE);
                 for (RobotInfo ri : enemyRats) {
                     MapLocation el = ri.getLocation();
                     int d = cur.distanceSquaredTo(el);
@@ -149,16 +169,7 @@ public strictfp class RobotPlayer {
                     int dx = el.x - myX, dy = el.y - myY;
                     int dist = (int) Math.round(Math.sqrt((double) dx * dx + (double) dy * dy));
                     int bearing = (int) Math.round(Math.toDegrees(Math.atan2(dx, dy)));
-                    if (d < best1) {
-                        best3 = best2; e3x = e2x; e3y = e2y; e3h = e2h; e3d = e2d;
-                        best2 = best1; e2x = e1x; e2y = e1y; e2h = e1h; e2d = e1d;
-                        best1 = d; e1x = dist; e1y = bearing; e1h = h; e1d = dir;
-                    } else if (d < best2) {
-                        best3 = best2; e3x = e2x; e3y = e2y; e3h = e2h; e3d = e2d;
-                        best2 = d; e2x = dist; e2y = bearing; e2h = h; e2d = dir;
-                    } else if (d < best3) {
-                        best3 = d; e3x = dist; e3y = bearing; e3h = h; e3d = dir;
-                    }
+                    insertNearest(eDistSq, eDist, eBear, eHealth, eDir, d, dist, bearing, h, dir);
                 }
 
                 // Nearest 3 allies (excluding self), own health, local
@@ -173,10 +184,10 @@ public strictfp class RobotPlayer {
                 // nothing to hear; the visible-allies loop below is the
                 // real source of ally data either way.
                 int ownHealthInt = (int) rc.getHealth();
-                int a1 = Integer.MAX_VALUE, a2 = Integer.MAX_VALUE, a3 = Integer.MAX_VALUE;
-                int allyX = 0, allyY = 0, ally2X = 0, ally2Y = 0, ally3X = 0, ally3Y = 0;
-                int allyH = 0, ally2H = 0, ally3H = 0;
-                int allyD = 0, ally2D = 0, ally3D = 0;
+                int[] aDistSq = new int[K_NEAREST];
+                int[] aDist = new int[K_NEAREST], aBear = new int[K_NEAREST], aHealth = new int[K_NEAREST];
+                int[] aDir = new int[K_NEAREST];
+                Arrays.fill(aDistSq, Integer.MAX_VALUE);
                 for (RobotInfo ri : friendlyRats) {
                     if (ri.getID() == rc.getID()) continue;
                     MapLocation al = ri.getLocation();
@@ -186,16 +197,7 @@ public strictfp class RobotPlayer {
                     int dx = al.x - myX, dy = al.y - myY;
                     int dist = (int) Math.round(Math.sqrt((double) dx * dx + (double) dy * dy));
                     int bearing = (int) Math.round(Math.toDegrees(Math.atan2(dx, dy)));
-                    if (d < a1) {
-                        a3 = a2; ally3X = ally2X; ally3Y = ally2Y; ally3H = ally2H; ally3D = ally2D;
-                        a2 = a1; ally2X = allyX; ally2Y = allyY; ally2H = allyH; ally2D = allyD;
-                        a1 = d;  allyX = dist; allyY = bearing; allyH = h; allyD = dir;
-                    } else if (d < a2) {
-                        a3 = a2; ally3X = ally2X; ally3Y = ally2Y; ally3H = ally2H; ally3D = ally2D;
-                        a2 = d;  ally2X = dist; ally2Y = bearing; ally2H = h; ally2D = dir;
-                    } else if (d < a3) {
-                        a3 = d;  ally3X = dist; ally3Y = bearing; ally3H = h; ally3D = dir;
-                    }
+                    insertNearest(aDistSq, aDist, aBear, aHealth, aDir, d, dist, bearing, h, dir);
                 }
 
                 int localHealthSum = ownHealthInt;
@@ -226,20 +228,29 @@ public strictfp class RobotPlayer {
                 sb.append(rc.getID()).append(',');
                 sb.append(myX).append(',');
                 sb.append(myY).append(',');
-                sb.append(e1x).append(',').append(e1y).append(',').append(e1h).append(',').append(e1d).append(',');
-                sb.append(e2x).append(',').append(e2y).append(',').append(e2h).append(',').append(e2d).append(',');
-                sb.append(e3x).append(',').append(e3y).append(',').append(e3h).append(',').append(e3d).append(',');
+                sb.append(eDist[0]).append(',').append(eBear[0]).append(',').append(eHealth[0]).append(',').append(eDir[0]).append(',');
+                sb.append(eDist[1]).append(',').append(eBear[1]).append(',').append(eHealth[1]).append(',').append(eDir[1]).append(',');
+                sb.append(eDist[2]).append(',').append(eBear[2]).append(',').append(eHealth[2]).append(',').append(eDir[2]).append(',');
                 sb.append(myDir).append(',');
                 sb.append(moveCd).append(',');
                 sb.append(actionCd).append(',');
                 sb.append(carrying).append(',');
                 sb.append(ownHealthInt).append(',');
-                sb.append(allyX).append(',').append(allyY).append(',').append(allyH).append(',').append(allyD).append(',');
+                sb.append(aDist[0]).append(',').append(aBear[0]).append(',').append(aHealth[0]).append(',').append(aDir[0]).append(',');
                 sb.append(localHealthSum).append(',');
-                sb.append(ally2X).append(',').append(ally2Y).append(',').append(ally2H).append(',').append(ally2D).append(',');
-                sb.append(ally3X).append(',').append(ally3Y).append(',').append(ally3H).append(',').append(ally3D).append(',');
+                sb.append(aDist[1]).append(',').append(aBear[1]).append(',').append(aHealth[1]).append(',').append(aDir[1]).append(',');
+                sb.append(aDist[2]).append(',').append(aBear[2]).append(',').append(aHealth[2]).append(',').append(aDir[2]).append(',');
                 sb.append(canMoveN).append(',').append(canMoveNE).append(',').append(canMoveE).append(',').append(canMoveSE).append(',');
-                sb.append(canMoveS).append(',').append(canMoveSW).append(',').append(canMoveW).append(',').append(canMoveNW);
+                sb.append(canMoveS).append(',').append(canMoveSW).append(',').append(canMoveW).append(',').append(canMoveNW).append(',');
+                // Appended slots 4-6, same (dist,bearing,health,dir) layout
+                // as slots 1-3 above -- see learner_rl/RobotPlayer.java's
+                // buildState() comment for why K widened from 3 to 6.
+                sb.append(eDist[3]).append(',').append(eBear[3]).append(',').append(eHealth[3]).append(',').append(eDir[3]).append(',');
+                sb.append(eDist[4]).append(',').append(eBear[4]).append(',').append(eHealth[4]).append(',').append(eDir[4]).append(',');
+                sb.append(eDist[5]).append(',').append(eBear[5]).append(',').append(eHealth[5]).append(',').append(eDir[5]).append(',');
+                sb.append(aDist[3]).append(',').append(aBear[3]).append(',').append(aHealth[3]).append(',').append(aDir[3]).append(',');
+                sb.append(aDist[4]).append(',').append(aBear[4]).append(',').append(aHealth[4]).append(',').append(aDir[4]).append(',');
+                sb.append(aDist[5]).append(',').append(aBear[5]).append(',').append(aHealth[5]).append(',').append(aDir[5]);
                 if (justCaptured) sb.append(",C");
                 String vs = String.format("%.1f", Globals.turnValue);
                 sb.append('|').append(vs).append('|');

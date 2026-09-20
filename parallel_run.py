@@ -143,7 +143,27 @@ class WorkerBatch:
 
     @property
     def label(self) -> str:
-        base = truncate(f"{self.team_a}-vs-{self.team_b}-on-{self.maps}", 60)
+        # 200, not the original 60: confirmed directly that 60 was too
+        # tight and caused two compounding real bugs, not just a cosmetic
+        # long filename. First form: truncating the whole "team_a-vs-
+        # team_b-on-map" string from the left made every trainingmapN map
+        # name collapse to the same 2-char prefix ("tr") once long bot
+        # package names (e.g. the *_zeroeps/*_ckptN_zeroeps evaluation
+        # variants) left almost no budget for the map name -- every map
+        # after the first with that prefix silently overwrote the
+        # previous one's log file on disk, dropping most maps' worth of
+        # results with no error anywhere. Second form (tried and reverted):
+        # truncating only the team-name portion avoids that collision, but
+        # team_sides_from_filename() in rl_collect.py recovers team names
+        # by splitting the filename on "-vs-"/"-on-", so a truncated team
+        # name there means the recovered name no longer equals the actual
+        # subject/opponent string, and collect_from_log() silently treats
+        # the match as "our team wasn't in it." 200 stays safely under
+        # macOS/Linux's 255-byte filename limit (even with "-workerN.log"
+        # appended) while being high enough that no realistic bot-name
+        # combination should ever actually hit it, sidestepping the need
+        # to truncate at all in practice.
+        base = truncate(f"{self.team_a}-vs-{self.team_b}-on-{self.maps}", 200)
         return f"{base}-worker{self.worker_id}"
 
 

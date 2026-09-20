@@ -19,7 +19,7 @@ MAPS = [
     "wallsofparadis", "whatsthecatdoin", "whereisthecheese", "ZeroDay",
 ]
 MAX_ROUNDS = 100
-STATE_DIM = 40
+STATE_DIM = 64
 HIDDEN_DIM = 32  # must match rl_train.py's HIDDEN_DIM
 NUM_TILES = 9
 TEACHER_EPOCHS = 1500
@@ -37,6 +37,34 @@ def neuralnet_java_path(package="econ5"):
 
 
 class TeacherTileNet(nn.Module):
+    # Hadamard-tanh (two independent tanh branches per layer, Klein et
+    # al. 2026) was tried here to fix a diagnosed E/W argmax collapse,
+    # but reverted: MSE-regressing against econ5's raw tile scores
+    # (magnitude in the hundreds) through tanh's bounded [-1,1] hidden
+    # activations drives the final layer toward large weights to reach
+    # that scale, which saturates the tanh branches -- confirmed directly
+    # (88.7% of the last hidden layer's neurons both-saturated >0.99,
+    # every one of the 9 outputs correlated at 1.000 with each other,
+    # i.e. one shared state-dependent signal plus tiny per-action
+    # offsets, not real differentiation) and Xavier/Glorot init didn't
+    # prevent it either -- the pressure comes from training dynamics
+    # (the large-magnitude regression target), not initialization. Back
+    # to plain ReLU; the E/W collapse is instead addressed by
+    # rl_train.py's ARGMAX_SHARE_COEF term, which targets the actual
+    # failure mode (population-level argmax concentration) directly
+    # rather than via an architecture change.
+    # Also tried: scaling to 900/450/225 (~9.7x params, same 4:2:1 ratio)
+    # to see if more capacity helped the E/W collapse. It trained fine
+    # (best loss yet, 114185 vs 129660 at the original size), but the
+    # teacher's own NeuralNet.java is what every robot calls every turn
+    # DURING self-play matches (training runs under bc-overrides'
+    # unlimited bytecode, so a bigger network can still execute, just
+    # slower) -- confirmed directly, match-playing time alone went from
+    # ~58s to ~243s per iteration (~4.2x), not just the PPO update step.
+    # Reverted back to 256/128/64: the E/W collapse this was meant to
+    # address is instead handled by rl_train.py's ARGMAX_SHARE_COEF term
+    # (architecture-independent), so the 4x slowdown bought nothing this
+    # run actually needed.
     def __init__(self, state_dim):
         super().__init__()
         self.shared = nn.Sequential(
@@ -119,6 +147,14 @@ def parse_obs(line):
         raw[24] / 64.0, raw[25] / 180.0, raw[26] / 100.0, raw[27] / 8.0,  # ally2
         raw[28] / 64.0, raw[29] / 180.0, raw[30] / 100.0, raw[31] / 8.0,  # ally3
         raw[32], raw[33], raw[34], raw[35], raw[36], raw[37], raw[38], raw[39],  # canMove x8
+        # Appended enemy/ally slots 4-6 -- see collect_dataset.py's
+        # identical duplicate of this function for the full rationale.
+        raw[40] / 64.0, raw[41] / 180.0, raw[42] / 100.0, raw[43] / 8.0,  # enemy4
+        raw[44] / 64.0, raw[45] / 180.0, raw[46] / 100.0, raw[47] / 8.0,  # enemy5
+        raw[48] / 64.0, raw[49] / 180.0, raw[50] / 100.0, raw[51] / 8.0,  # enemy6
+        raw[52] / 64.0, raw[53] / 180.0, raw[54] / 100.0, raw[55] / 8.0,  # ally4
+        raw[56] / 64.0, raw[57] / 180.0, raw[58] / 100.0, raw[59] / 8.0,  # ally5
+        raw[60] / 64.0, raw[61] / 180.0, raw[62] / 100.0, raw[63] / 8.0,  # ally6
     ]
     value = float(parts[1]) if parts[1].strip() else 0.0
     tilescores = [int(x) for x in parts[2].split(",") if x.strip()]
@@ -282,13 +318,21 @@ def export_neuralnet_java(model, path, package="learner", state_dim=18, hidden=2
 
         f.write("\n")
 
+        # Single chained expression per neuron, not a sequence of "h{j} +=
+        # ...;" statements -- each term in a compound-assignment statement
+        # has to reload h{j} from its local variable slot and store the
+        # new value back (fload/ldc_w/fload/fmul/fadd/fstore, 6 bytecode
+        # ops), while a chained "+" expression keeps the running sum on the
+        # JVM operand stack the whole time (ldc_w/fload/fmul/fadd, 4 ops) --
+        # measured directly (javap -c on both forms, HIDDEN=32/STATE_DIM=64):
+        # 14143 -> 9919 total instructions, a 30% cut, pushing this well
+        # back under BABY_RAT's 17500 bytecode/turn budget. Left-to-right
+        # evaluation order (and thus the exact floating-point result) is
+        # identical to the old form -- this only changes the bytecode shape.
         for j in range(hidden):
-            f.write(f"        float h{j} = 0;\n")
-            for i in range(state_dim):
-                w = w_sh[j, i].item()
-                f.write(f"        h{j} += {fmt(w)} * in{i};\n")
+            terms = " + ".join(f"{fmt(w_sh[j, i].item())} * in{i}" for i in range(state_dim))
             b = b_sh[j].item()
-            f.write(f"        h{j} += {fmt(b)};\n")
+            f.write(f"        float h{j} = {terms} + {fmt(b)};\n")
             f.write(f"        if (h{j} < 0) h{j} = 0;\n\n")
 
         for j in range(NUM_TILES):
