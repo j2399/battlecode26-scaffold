@@ -1435,7 +1435,16 @@ def snapshot_self(model, iteration: int, name: str = None, zero_eps: bool = Fals
         if (zero_eps or epsilon is not None) and java_file.name == "RobotPlayer.java":
             before = text
             new_value = 0.0 if zero_eps else epsilon
-            text = text.replace("static final float EPSILON = 0.33f;", f"static final float EPSILON = {new_value}f;")
+            # Regex on the declaration shape, not a literal "= 0.33f;"
+            # match -- a hardcoded literal silently stopped matching (no
+            # exception, just a no-op) the moment learner_rl's own
+            # EPSILON was ever changed to something other than 0.33, which
+            # is exactly what happened when main training's EPSILON was
+            # lowered to 0.2: every exploiter export since then silently
+            # inherited whatever learner_rl's current EPSILON was instead
+            # of EXPLOITER_EPSILON, caught only by the warning below.
+            text = re.sub(r"static final float EPSILON = [^;]+;",
+                           f"static final float EPSILON = {new_value}f;", text)
             if text == before:
                 print(f"WARNING: zero_eps/epsilon set but EPSILON replace had no effect in {name}/RobotPlayer.java", flush=True)
         (dest_dir / java_file.name).write_text(text)
